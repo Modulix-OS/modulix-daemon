@@ -3,8 +3,8 @@
 //! PropertiesChanged when the underlying write fails, e.g. read-only /etc).
 
 use futures_util::StreamExt;
-use zbus::{Connection, MatchRule};
 use zbus::message::Type;
+use zbus::{Connection, MatchRule};
 
 use super::Listener;
 use crate::error::Error;
@@ -18,7 +18,6 @@ impl Listener for Hostname1Listener {
     }
 
     async fn listen(&self, _: Connection) -> Result<(), Error> {
-
         let monitor_conn = Connection::system().await?;
 
         let rule = MatchRule::builder()
@@ -44,7 +43,9 @@ impl Listener for Hostname1Listener {
             let msg = msg?;
             let header = msg.header();
 
-            let Some(member) = header.member() else { continue };
+            let Some(member) = header.member() else {
+                continue;
+            };
 
             match member.as_str() {
                 "SetStaticHostname" => {

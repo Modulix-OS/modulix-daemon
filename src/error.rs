@@ -9,3 +9,12 @@ pub enum Error {
     #[error("D-Bus error: {0}")]
     Zbus(#[from] zbus::Error),
 }
+
+impl From<Error> for zbus::fdo::Error {
+    /// Map a crate error to a D-Bus error reply for own-interface methods.
+    fn from(err: Error) -> Self {
+        match err {
+            Error::Zbus(err) => zbus::fdo::Error::ZBus(err),
+        }
+    }
+}

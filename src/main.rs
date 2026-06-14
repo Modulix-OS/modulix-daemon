@@ -21,7 +21,7 @@ async fn main() -> Result<(), Error> {
 
     let connection = zbus::connection::Builder::system()?
         .name(daemon::BUS_NAME)?
-        .serve_at(daemon::OBJECT_PATH, daemon::Daemon)?
+        .serve_at(daemon::OBJECT_PATH, daemon::Daemon::new())?
         .build()
         .await?;
 

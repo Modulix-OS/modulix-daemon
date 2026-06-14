@@ -51,3 +51,29 @@ async fn uninstall_plugin_delegates_to_command() {
     let result = daemon.uninstall_plugin("audio", "reverb").await.unwrap();
     assert_eq!(result, "plugin reverb uninstalled for module audio");
 }
+
+#[tokio::test]
+async fn set_options_applies_options_and_lists() {
+    let daemon = Daemon::new();
+    let result = daemon
+        .set_options(
+            vec![("theme".to_string(), "dark".to_string(), false)],
+            vec![("favorites".to_string(), "vim".to_string(), false)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        "option theme set to dark\nlist favorites entry set to vim"
+    );
+}
+
+#[tokio::test]
+async fn set_options_handles_resets_and_empty_arrays() {
+    let daemon = Daemon::new();
+    let result = daemon
+        .set_options(vec![("theme".to_string(), String::new(), true)], Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(result, "option theme reset to default");
+}

@@ -8,6 +8,7 @@ mod lifecycle;
 mod module;
 mod package;
 mod plugin;
+pub(crate) mod setting;
 
 use async_trait::async_trait;
 

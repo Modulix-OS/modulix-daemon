@@ -7,4 +7,22 @@
   <vendor>ModulixOS Daemon</vendor>
   <vendor_url>https://example.com</vendor_url>
 
+
+  <action id="org.modulix.daemon.install-system-package">
+    <description>Install a system-wide package</description>
+    <description
+            xml:lang="fr"
+        >Installer un paquet au niveau système</description>
+    <message>Authentication is required to install a system package.</message>
+    <message
+            xml:lang="fr"
+        >Une authentification est requise pour installer un paquet système.</message>
+
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+
 </policyconfig>

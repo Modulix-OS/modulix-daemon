@@ -10,6 +10,8 @@ use zbus::Connection;
 
 use crate::error::Error;
 
+mod udisks2;
+
 /// A single listened D-Bus interface.
 #[async_trait]
 pub trait Listener: Send + Sync {
@@ -25,7 +27,7 @@ pub trait Listener: Send + Sync {
 ///
 /// Add a new implementation here to start watching another D-Bus interface.
 pub fn registry() -> Vec<Box<dyn Listener>> {
-    vec![]
+    vec![Box::new(udisks2::Udisks2Listener)]
 }
 
 #[cfg(test)]

@@ -71,7 +71,7 @@
     nixosModules.mx-daemon = { config, lib, pkgs, ... }:
       import ./module.nix {
         inherit config lib pkgs self;
-        system = pkgs.system;
+        system = pkgs.stdenv.hostPlatform.system;
       };
 
     nixosModules.default = self.nixosModules.mx-daemon;

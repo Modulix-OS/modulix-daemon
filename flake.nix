@@ -4,11 +4,6 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
-    naersk = {
-      url = "github:nix-community/naersk";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-
     flake-utils.url = "github:numtide/flake-utils";
 
     modulix-core-utils = {
@@ -17,19 +12,16 @@
     };
   };
 
-  outputs = { self, nixpkgs, naersk, flake-utils, modulix-core-utils }:
+  outputs = { self, nixpkgs, flake-utils, modulix-core-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-
-        naersk' = pkgs.callPackage naersk {};
 
         nativeBuildInputs = [
           pkgs.pkg-config
           pkgs.cmake
           pkgs.perl
         ];
-        # openssl: pulled in transitively by modulix-core-utils (reqwest / native-tls).
         buildInputs       = [ pkgs.dbus pkgs.openssl ];
 
         postUnpack = ''
@@ -45,19 +37,18 @@
             $out/share/polkit-1/actions/org.modulix.daemon.policy
         '';
 
-        mx-daemon = naersk'.buildPackage {
+        mkMxDaemon = { release }: pkgs.rustPlatform.buildRustPackage {
           pname = "mx-daemon";
-          src   = ./.;
+          version = "0.1.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
           inherit nativeBuildInputs buildInputs postUnpack postInstall;
-          release = true;
+          buildType = if release then "release" else "debug";
+          doCheck = false;
         };
 
-        mx-daemon-debug = naersk'.buildPackage {
-          pname = "mx-daemon";
-          src   = ./.;
-          inherit nativeBuildInputs buildInputs postUnpack postInstall;
-          release = false;
-        };
+        mx-daemon = mkMxDaemon { release = true; };
+        mx-daemon-debug = mkMxDaemon { release = false; };
 
       in {
         packages = {

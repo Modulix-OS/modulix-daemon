@@ -10,24 +10,32 @@
     };
 
     flake-utils.url = "github:numtide/flake-utils";
+
+    modulix-core-utils = {
+      url = "git+file:///home/quentin/Programmes/Modulix-OS/modulix-core-utils";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, naersk, flake-utils, ... }:
+  outputs = { self, nixpkgs, naersk, flake-utils, modulix-core-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
         naersk' = pkgs.callPackage naersk {};
 
-        nativeBuildInputs = [ pkgs.pkg-config ];
+        nativeBuildInputs = [
+          pkgs.pkg-config
+          pkgs.cmake
+          pkgs.perl
+        ];
         # openssl: pulled in transitively by modulix-core-utils (reqwest / native-tls).
         buildInputs       = [ pkgs.dbus pkgs.openssl ];
 
-        # NOTE: modulix-core-utils is a `path = "../modulix-core-utils"` cargo
-        # dependency. `cargo build` inside a checkout that has the sibling crate
-        # works as-is. For `nix build`, naersk only copies `src = ./.` into the
-        # sandbox, so core-utils must additionally be vendored (add it as a flake
-        # input and include its source), mirroring gnome-software-plugin/backend.
+        postUnpack = ''
+          cp -r --no-preserve=mode,ownership \
+            ${modulix-core-utils} "$NIX_BUILD_TOP/modulix-core-utils"
+        '';
 
         postInstall = ''
             install -Dm644 org.modulix.Daemon.conf \
@@ -40,16 +48,14 @@
         mx-daemon = naersk'.buildPackage {
           pname = "mx-daemon";
           src   = ./.;
-          inherit nativeBuildInputs buildInputs postInstall;
+          inherit nativeBuildInputs buildInputs postUnpack postInstall;
           release = true;
-
-
         };
 
         mx-daemon-debug = naersk'.buildPackage {
           pname = "mx-daemon";
           src   = ./.;
-          inherit nativeBuildInputs buildInputs postInstall;
+          inherit nativeBuildInputs buildInputs postUnpack postInstall;
           release = false;
         };
 

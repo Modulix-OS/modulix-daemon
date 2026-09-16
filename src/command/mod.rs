@@ -25,9 +25,10 @@ pub trait Command: Send + Sync {
 
     /// Run the command, delegating to the user's external library.
     ///
-    /// `arguments` holds the D-Bus method's parameters in order (e.g. a
-    /// single package/module name, or a module name followed by a plugin
-    /// name).
+    /// `arguments` holds the D-Bus method's parameters in order (e.g. one or
+    /// more package/module names, or a module name followed by a plugin
+    /// name). The library functions for package/module commands take the
+    /// whole name list at once.
     async fn execute(&self, arguments: &[&str]) -> Result<String, Error>;
 }
 

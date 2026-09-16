@@ -2,10 +2,14 @@
 //!
 //! Commands are added as methods on the [`Daemon`] interface impl below,
 //! each delegating to a [`crate::command::Command`] from
-//! [`crate::command::registry`].
+//! [`crate::command::registry`]. Every method first checks polkit
+//! authorization (see [`crate::polkit`]) for the caller identified by the
+//! message header — the D-Bus policy (`org.modulix.Daemon.conf`) only
+//! controls who can *reach* these methods, not who is allowed to use them.
 
 use crate::command::setting::{Setting, apply_list, apply_option};
 use crate::command::{self, Command};
+use crate::polkit::{self, ACTION_INSTALL, ACTION_REMOVE};
 
 /// Well-known bus name the daemon owns.
 pub const BUS_NAME: &str = "org.modulix.Daemon";
@@ -27,13 +31,23 @@ impl Daemon {
         }
     }
 
-    /// Find the command named `name` and run it with `arguments`.
-    async fn run(&self, name: &str, arguments: &[&str]) -> zbus::fdo::Result<String> {
+    /// Check `action_id` for the caller in `header`, then find the command
+    /// named `name` and run it with `arguments`.
+    async fn run(
+        &self,
+        connection: &zbus::Connection,
+        header: &zbus::message::Header<'_>,
+        action_id: &str,
+        name: &str,
+        arguments: &[&str],
+    ) -> zbus::fdo::Result<String> {
+        polkit::check(connection, header, action_id).await?;
+
         let command = self
             .commands
             .iter()
             .find(|command| command.name() == name)
-            .expect("every interface method has a matching registered command");
+            .ok_or_else(|| zbus::fdo::Error::UnknownMethod(name.to_string()))?;
 
         command.execute(arguments).await.map_err(Into::into)
     }
@@ -47,34 +61,102 @@ impl Default for Daemon {
 
 #[zbus::interface(name = "org.modulix.Daemon")]
 impl Daemon {
-    /// Install a system package by name.
-    async fn install_package(&self, name: &str) -> zbus::fdo::Result<String> {
-        self.run("InstallPackage", &[name]).await
+    /// Install one or more system packages by name.
+    async fn install_package(
+        &self,
+        names: Vec<&str>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        self.run(
+            connection,
+            &header,
+            ACTION_INSTALL,
+            "InstallPackage",
+            &names,
+        )
+        .await
     }
 
-    /// Uninstall a system package by name.
-    async fn uninstall_package(&self, name: &str) -> zbus::fdo::Result<String> {
-        self.run("UninstallPackage", &[name]).await
+    /// Uninstall one or more system packages by name.
+    async fn uninstall_package(
+        &self,
+        names: Vec<&str>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        self.run(
+            connection,
+            &header,
+            ACTION_REMOVE,
+            "UninstallPackage",
+            &names,
+        )
+        .await
     }
 
-    /// Install a Modulix module by name.
-    async fn install_module(&self, name: &str) -> zbus::fdo::Result<String> {
-        self.run("InstallModule", &[name]).await
+    /// Install one or more Modulix modules by name.
+    async fn install_module(
+        &self,
+        names: Vec<&str>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        self.run(connection, &header, ACTION_INSTALL, "InstallModule", &names)
+            .await
     }
 
-    /// Uninstall a Modulix module by name.
-    async fn uninstall_module(&self, name: &str) -> zbus::fdo::Result<String> {
-        self.run("UninstallModule", &[name]).await
+    /// Uninstall one or more Modulix modules by name.
+    async fn uninstall_module(
+        &self,
+        names: Vec<&str>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        self.run(
+            connection,
+            &header,
+            ACTION_REMOVE,
+            "UninstallModule",
+            &names,
+        )
+        .await
     }
 
     /// Install a plugin for a module, given the module and plugin names.
-    async fn install_plugin(&self, module: &str, plugin: &str) -> zbus::fdo::Result<String> {
-        self.run("InstallPlugin", &[module, plugin]).await
+    async fn install_plugin(
+        &self,
+        module: &str,
+        plugin: &str,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        self.run(
+            connection,
+            &header,
+            ACTION_INSTALL,
+            "InstallPlugin",
+            &[module, plugin],
+        )
+        .await
     }
 
     /// Uninstall a plugin from a module, given the module and plugin names.
-    async fn uninstall_plugin(&self, module: &str, plugin: &str) -> zbus::fdo::Result<String> {
-        self.run("UninstallPlugin", &[module, plugin]).await
+    async fn uninstall_plugin(
+        &self,
+        module: &str,
+        plugin: &str,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        self.run(
+            connection,
+            &header,
+            ACTION_REMOVE,
+            "UninstallPlugin",
+            &[module, plugin],
+        )
+        .await
     }
 
     /// Apply scalar option and/or list-entry changes in a single call.
@@ -113,7 +195,11 @@ impl Daemon {
         &self,
         options: Vec<Setting>,
         lists: Vec<Setting>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> zbus::fdo::Result<String> {
+        polkit::check(connection, &header, ACTION_INSTALL).await?;
+
         let mut results = Vec::with_capacity(options.len() + lists.len());
 
         for option in &options {

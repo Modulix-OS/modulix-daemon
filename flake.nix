@@ -20,7 +20,14 @@
         naersk' = pkgs.callPackage naersk {};
 
         nativeBuildInputs = [ pkgs.pkg-config ];
-        buildInputs       = [ pkgs.dbus ];
+        # openssl: pulled in transitively by modulix-core-utils (reqwest / native-tls).
+        buildInputs       = [ pkgs.dbus pkgs.openssl ];
+
+        # NOTE: modulix-core-utils is a `path = "../modulix-core-utils"` cargo
+        # dependency. `cargo build` inside a checkout that has the sibling crate
+        # works as-is. For `nix build`, naersk only copies `src = ./.` into the
+        # sandbox, so core-utils must additionally be vendored (add it as a flake
+        # input and include its source), mirroring gnome-software-plugin/backend.
 
         postInstall = ''
             install -Dm644 org.modulix.Daemon.conf \

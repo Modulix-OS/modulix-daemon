@@ -1,17 +1,22 @@
-//! Shared shape for "install X / uninstall X by name" commands.
+//! Shared shape for "install X / uninstall X by name(s)" commands backed by
+//! a blocking `fn(config_dir: &str, names: &[&str]) -> mx::Result<()>` pair
+//! from `modulix-core-utils`.
 
 /// Generate a pair of [`Command`](super::Command) implementations for
-/// installing and uninstalling something identified by a single name.
+/// installing and uninstalling one or more things identified by name.
 ///
 /// `$install`/`$uninstall` (D-Bus method names, e.g. `InstallPackage`) become
-/// the generated struct names; `$kind` is the noun used in the log message,
-/// the stubbed library call (`install-$kind`/`uninstall-$kind`) and the
-/// returned status string.
+/// the generated struct names; `$kind` is the noun used in the log message
+/// and the returned status string; `$install_fn`/`$uninstall_fn` are the
+/// blocking `modulix-core-utils` calls run via `spawn_blocking`, skipped when
+/// [`crate::dry_run::is_dry_run`] is true.
+///
+/// `arguments` holds one name per element, forwarded in a single call.
 ///
 /// Requires `Command` and `Error` to be in scope at the call site.
 #[macro_export]
 macro_rules! lifecycle_commands {
-    ($install:ident, $uninstall:ident, $kind:literal) => {
+    ($install:ident, $uninstall:ident, $kind:literal, $install_fn:path, $uninstall_fn:path) => {
         pub struct $install;
 
         #[async_trait::async_trait]
@@ -21,16 +26,22 @@ macro_rules! lifecycle_commands {
             }
 
             async fn execute(&self, arguments: &[&str]) -> Result<String, Error> {
-                let [name] = arguments else {
-                    unreachable!(concat!(stringify!($install), " takes exactly one argument"))
-                };
+                let names = arguments.join(", ");
 
-                tracing::info!(name = %name, concat!("installing ", $kind));
+                tracing::info!(names = %names, concat!("installing ", $kind));
 
-                #[cfg(not(debug_assertions))]
-                println!(concat!("install-", $kind, " {}"), name);
+                if !$crate::dry_run::is_dry_run() {
+                    let owned: Vec<String> = arguments.iter().map(|s| s.to_string()).collect();
+                    tokio::task::spawn_blocking(move || {
+                        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+                        $install_fn(modulix_core_utils::CONFIG_DIRECTORY, &refs)
+                    })
+                    .await
+                    .map_err(|e| Error::CoreUtils(e.to_string()))?
+                    .map_err(|e| Error::CoreUtils(e.to_string()))?;
+                }
 
-                Ok(format!(concat!($kind, " {} installed"), name))
+                Ok(format!(concat!($kind, " {} installed"), names))
             }
         }
 
@@ -43,16 +54,22 @@ macro_rules! lifecycle_commands {
             }
 
             async fn execute(&self, arguments: &[&str]) -> Result<String, Error> {
-                let [name] = arguments else {
-                    unreachable!(concat!(stringify!($uninstall), " takes exactly one argument"))
-                };
+                let names = arguments.join(", ");
 
-                tracing::info!(name = %name, concat!("uninstalling ", $kind));
+                tracing::info!(names = %names, concat!("uninstalling ", $kind));
 
-                #[cfg(not(debug_assertions))]
-                println!(concat!("uninstall-", $kind, " {}"), name);
+                if !$crate::dry_run::is_dry_run() {
+                    let owned: Vec<String> = arguments.iter().map(|s| s.to_string()).collect();
+                    tokio::task::spawn_blocking(move || {
+                        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+                        $uninstall_fn(modulix_core_utils::CONFIG_DIRECTORY, &refs)
+                    })
+                    .await
+                    .map_err(|e| Error::CoreUtils(e.to_string()))?
+                    .map_err(|e| Error::CoreUtils(e.to_string()))?;
+                }
 
-                Ok(format!(concat!($kind, " {} uninstalled"), name))
+                Ok(format!(concat!($kind, " {} uninstalled"), names))
             }
         }
     };

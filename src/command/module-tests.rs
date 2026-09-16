@@ -21,3 +21,15 @@ async fn uninstall_module_reports_success() {
     let result = UninstallModule.execute(&["audio"]).await.unwrap();
     assert_eq!(result, "module audio uninstalled");
 }
+
+#[tokio::test]
+async fn install_module_reports_success_for_multiple_names() {
+    let result = InstallModule.execute(&["audio", "video"]).await.unwrap();
+    assert_eq!(result, "module audio, video installed");
+}
+
+#[tokio::test]
+async fn uninstall_module_reports_success_for_multiple_names() {
+    let result = UninstallModule.execute(&["audio", "video"]).await.unwrap();
+    assert_eq!(result, "module audio, video uninstalled");
+}

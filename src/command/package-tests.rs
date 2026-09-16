@@ -21,3 +21,15 @@ async fn uninstall_package_reports_success() {
     let result = UninstallPackage.execute(&["htop"]).await.unwrap();
     assert_eq!(result, "package htop uninstalled");
 }
+
+#[tokio::test]
+async fn install_package_reports_success_for_multiple_names() {
+    let result = InstallPackage.execute(&["htop", "vim"]).await.unwrap();
+    assert_eq!(result, "package htop, vim installed");
+}
+
+#[tokio::test]
+async fn uninstall_package_reports_success_for_multiple_names() {
+    let result = UninstallPackage.execute(&["htop", "vim"]).await.unwrap();
+    assert_eq!(result, "package htop, vim uninstalled");
+}

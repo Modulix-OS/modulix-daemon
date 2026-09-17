@@ -32,6 +32,8 @@ in {
       requires       = [ "dbus.service" ];
       wantedBy       = [ "multi-user.target" ];
 
+      path = [ pkgs.nix ];
+
       serviceConfig = {
         Type            = "dbus";
         BusName         = "org.modulix.Daemon";

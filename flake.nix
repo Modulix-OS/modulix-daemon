@@ -37,22 +37,31 @@
             $out/share/polkit-1/actions/org.modulix.daemon.policy
         '';
 
-        mkMxDaemon = { release }: pkgs.rustPlatform.buildRustPackage {
-          pname = "mx-daemon";
+        mkMxDaemon = { release, test ? false }: pkgs.rustPlatform.buildRustPackage {
+          pname = if test then "mx-daemon-test" else "mx-daemon";
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
-          inherit nativeBuildInputs buildInputs postUnpack postInstall;
+          inherit buildInputs postUnpack;
+          nativeBuildInputs = nativeBuildInputs
+            ++ nixpkgs.lib.optional test pkgs.makeWrapper;
           buildType = if release then "release" else "debug";
           doCheck = false;
+
+          postInstall = postInstall + nixpkgs.lib.optionalString test ''
+            wrapProgram $out/bin/mx-daemon \
+              --run 'export MX_DAEMON_CONFIG_DIR="''${MX_DAEMON_CONFIG_DIR:-$HOME/modulix-test-config}"' \
+              --set-default MX_DAEMON_DRY_RUN 0
+          '';
         };
 
         mx-daemon = mkMxDaemon { release = true; };
         mx-daemon-debug = mkMxDaemon { release = false; };
+        mx-daemon-test = mkMxDaemon { release = false; test = true; };
 
       in {
         packages = {
-          inherit mx-daemon mx-daemon-debug;
+          inherit mx-daemon mx-daemon-debug mx-daemon-test;
           default = mx-daemon;
         };
 

@@ -74,6 +74,14 @@ where
         (at.elapsed() < self.ttl).then(|| value.clone())
     }
 
+    /// Drops every entry, fresh ones included. For caches whose validity
+    /// depends on state this process itself mutates (see
+    /// `crate::store::invalidate_installed`), where waiting out the TTL would
+    /// serve a value already known to be wrong.
+    pub fn clear(&self) {
+        self.entries.lock().unwrap().clear();
+    }
+
     /// Directly stores an already-resolved value for `key`.
     pub fn insert(&self, key: K, value: V) {
         let cell = Arc::new(OnceCell::new());

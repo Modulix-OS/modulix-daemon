@@ -51,6 +51,11 @@ pub struct AppEntry {
     pub variant_rank: i32,
     /// Raw search relevance (`0` outside search paths).
     pub score: u32,
+    /// Whether this exact `name` is currently in the system configuration.
+    /// Stamped by `crate::store` *after* every cache read (see
+    /// `stamp_installed`), never inside a cached value: a search result held
+    /// for 60s must not carry a 60s-old install state.
+    pub installed: bool,
 }
 
 impl AppEntry {
@@ -82,6 +87,9 @@ impl AppEntry {
         if self.score > 0 {
             d.insert("score".into(), ov(self.score));
         }
+        // Always emitted, unlike `score`: a client must be able to tell
+        // "not installed" from "daemon too old to say".
+        d.insert("installed".into(), ov(self.installed));
         d
     }
 }
@@ -191,6 +199,7 @@ pub fn package_entry(pkg: &NixPackage, score: u32) -> AppEntry {
         flatpak_preferred,
         variant_rank: rank,
         score,
+        installed: false,
     }
 }
 
@@ -233,23 +242,52 @@ pub fn module_entry(module: &ModuleInfo, score: u32) -> AppEntry {
         flatpak_preferred: false,
         variant_rank: 0,
         score,
+        installed: false,
     }
 }
 
 /// Collapse nix variants that share a grouping key into one entry: same-app-id
 /// variants (`firefox`, `firefox-bin` → one "Firefox") **and** same-pname
-/// variants (`nvtopPackages.amd`, `nvtopPackages.nvidia` → one "nvtop"). The
-/// first entry per key wins (search results are relevance-sorted); entries
-/// without a `group_id` are kept individually. The dropped variants stay
-/// reachable through [`crate::store::Store::packages_for_app_id`].
+/// variants (`nvtopPackages.amd`, `nvtopPackages.nvidia` → one "nvtop").
+/// Entries without a `group_id` are kept individually. The dropped variants
+/// stay reachable through [`crate::store::Store::packages_for_app_id`].
+///
+/// An **installed** variant represents its group; otherwise the first entry
+/// per key wins, search results being relevance-sorted. That exception is what
+/// keeps the row the store displays the one the user actually has — and the
+/// one its Uninstall button targets: with `firefox-bin` installed but
+/// `firefox` scoring higher, first-wins would show an available `firefox`.
+/// Callers must therefore stamp `installed` *before* deduplicating (see
+/// `crate::store::stamp_installed`).
 pub fn dedup_by_group(entries: Vec<AppEntry>) -> Vec<AppEntry> {
-    let mut seen = std::collections::HashSet::new();
-    entries
+    // Index into `entries` of each group's current winner, in output order.
+    let mut winners: Vec<usize> = Vec::new();
+    // group_id → slot in `winners`.
+    let mut slot_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for (i, e) in entries.iter().enumerate() {
+        let Some(gid) = &e.group_id else {
+            winners.push(i);
+            continue;
+        };
+        match slot_of.get(gid) {
+            None => {
+                slot_of.insert(gid.clone(), winners.len());
+                winners.push(i);
+            }
+            Some(&slot) if e.installed && !entries[winners[slot]].installed => {
+                winners[slot] = i;
+            }
+            Some(_) => {}
+        }
+    }
+
+    // Every index in `winners` is distinct (a slot is overwritten, never
+    // duplicated), so each `take()` sees its entry still in place.
+    let mut entries: Vec<Option<AppEntry>> = entries.into_iter().map(Some).collect();
+    winners
         .into_iter()
-        .filter(|e| match &e.group_id {
-            Some(id) => seen.insert(id.clone()),
-            None => true,
-        })
+        .filter_map(|i| entries[i].take())
         .collect()
 }
 
@@ -411,6 +449,7 @@ pub async fn module_rows_for_app_id(app_id: &str, timeout: std::time::Duration) 
             flatpak_preferred: false,
             variant_rank: 0,
             score: 0,
+            installed: false,
         })
         .collect()
 }
@@ -447,6 +486,7 @@ mod tests {
             flatpak_preferred: false,
             variant_rank: 20,
             score: 0,
+            installed: false,
         }
     }
 
@@ -466,6 +506,35 @@ mod tests {
         ]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "nvtopPackages.full"); // first wins
+    }
+
+    #[test]
+    fn dedup_by_group_installed_variant_wins() {
+        let mut installed = grp_entry("nvtopPackages.amd", None, "nvtop");
+        installed.installed = true;
+        let out = dedup_by_group(vec![
+            grp_entry("nvtopPackages.full", None, "nvtop"),
+            installed,
+            grp_entry("nvtopPackages.nvidia", None, "nvtop"),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "nvtopPackages.amd");
+        assert!(out[0].installed);
+    }
+
+    #[test]
+    fn dedup_by_group_keeps_group_order() {
+        let mut installed = grp_entry("b2", None, "b");
+        installed.installed = true;
+        let out = dedup_by_group(vec![
+            grp_entry("a1", None, "a"),
+            grp_entry("b1", None, "b"),
+            installed,
+            grp_entry("c1", None, "c"),
+        ]);
+        // Replacing a group's winner must not move the group in the output.
+        let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a1", "b2", "c1"]);
     }
 
     #[test]

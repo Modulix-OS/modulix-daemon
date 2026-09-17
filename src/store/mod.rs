@@ -9,16 +9,15 @@
 
 pub mod entry;
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
 use modulix_core_utils::module_info::ModuleInfo;
 use modulix_core_utils::package_info::{self, NixPackage};
 use modulix_core_utils::{
-    AppInfoGui, AppInfoMinimal, CONFIG_DIRECTORY, FlatpakInfo, install_module, install_package,
-    package_index,
+    AppInfoGui, AppInfoMinimal, FlatpakInfo, install_module, install_package, package_index,
 };
 
 use crate::cache::FlightCache;
@@ -40,6 +39,10 @@ const SEARCH_CACHE_TTL: Duration = Duration::from_secs(60);
 const ALT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const ENRICH_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const PLUGINS_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+/// Short on purpose: the configuration can also change behind the daemon's
+/// back (the `mx` CLI, a hand-edited `package.nix`). Writes that go *through*
+/// the daemon don't wait for it — they call [`invalidate_installed`].
+const INSTALLED_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// Ceiling on `nix eval` invocations a single `GetPackageLicenses` call may
 /// trigger. GNOME Software asks for a license on the details page (one app),
@@ -63,6 +66,7 @@ static ALT_CACHE: OnceLock<FlightCache<String, Vec<AppEntry>>> = OnceLock::new()
 static ENRICH_CACHE: OnceLock<FlightCache<String, Option<EnrichEntry>>> = OnceLock::new();
 static PLUGINS_CACHE: OnceLock<FlightCache<String, Vec<PluginEntry>>> = OnceLock::new();
 static LICENSE_CACHE: OnceLock<FlightCache<String, Option<String>>> = OnceLock::new();
+static INSTALLED_CACHE: OnceLock<FlightCache<(), Arc<InstalledSets>>> = OnceLock::new();
 
 fn search_cache() -> &'static FlightCache<SearchKey, Vec<AppEntry>> {
     SEARCH_CACHE.get_or_init(|| FlightCache::new(SEARCH_CACHE_TTL, CACHE_CAP))
@@ -83,6 +87,92 @@ fn plugins_cache() -> &'static FlightCache<String, Vec<PluginEntry>> {
 /// Licenses change only when nixpkgs does: same generous TTL as enrichment.
 fn license_cache() -> &'static FlightCache<String, Option<String>> {
     LICENSE_CACHE.get_or_init(|| FlightCache::new(ENRICH_CACHE_TTL, CACHE_CAP))
+}
+
+/// What the system configuration currently declares: nixpkgs attributes in
+/// `environment.systemPackages`, and enabled `mx.*` modules.
+///
+/// Both listings are pure parsing of the config files — no `nix eval`, no
+/// network — which is what makes it affordable to consult them on the search
+/// path (see [`installed_sets`]).
+#[derive(Default)]
+struct InstalledSets {
+    packages: HashSet<String>,
+    modules: HashSet<String>,
+}
+
+impl InstalledSets {
+    fn contains(&self, entry: &AppEntry) -> bool {
+        if entry.kind == "module" {
+            self.modules.contains(&entry.name)
+        } else {
+            self.packages.contains(&entry.name)
+        }
+    }
+}
+
+fn installed_cache() -> &'static FlightCache<(), Arc<InstalledSets>> {
+    // One key, so `cap` only has to be non-zero.
+    INSTALLED_CACHE.get_or_init(|| FlightCache::new(INSTALLED_CACHE_TTL, 1))
+}
+
+/// The cached installed sets. Behind an `Arc`: one search stamps hundreds of
+/// entries against the same snapshot, and cloning the sets each time would
+/// dwarf the lookup itself.
+async fn installed_sets() -> Arc<InstalledSets> {
+    installed_cache()
+        .get_or_fetch((), || async {
+            let dir = crate::config_dir::config_dir();
+            let packages = tokio::task::spawn_blocking(move || {
+                install_package::list_installed_package_names(dir)
+            })
+            .await
+            .map_err(|e| tracing::warn!(error = %e, "installed_sets: packages: join"))
+            .ok()
+            .and_then(|r| {
+                r.map_err(|e| tracing::warn!(error = %e, "installed_sets: packages"))
+                    .ok()
+            })
+            .unwrap_or_default();
+            let modules =
+                tokio::task::spawn_blocking(move || install_module::list_enabled_module_names(dir))
+                    .await
+                    .map_err(|e| tracing::warn!(error = %e, "installed_sets: modules: join"))
+                    .ok()
+                    .and_then(|r| {
+                        r.map_err(|e| tracing::warn!(error = %e, "installed_sets: modules"))
+                            .ok()
+                    })
+                    .unwrap_or_default();
+            Arc::new(InstalledSets {
+                packages: packages.into_iter().collect(),
+                modules: modules.into_iter().collect(),
+            })
+        })
+        .await
+}
+
+/// Fills in [`AppEntry::installed`] for a batch of entries.
+///
+/// Always applied **after** a [`FlightCache`] read, never inside the fetch
+/// closure: `SEARCH_CACHE` keeps a result for 60s and `ALT_CACHE` for 5
+/// minutes — longer than an install takes — so a flag baked into the cached
+/// value would leave the store offering "Install" for an app the user has
+/// just installed. Must also run *before* [`dedup_by_group`], which uses the
+/// flag to elect each group's representative.
+async fn stamp_installed(entries: &mut [AppEntry]) {
+    let sets = installed_sets().await;
+    for entry in entries.iter_mut() {
+        entry.installed = sets.contains(entry);
+    }
+}
+
+/// Drops the cached installed sets, so the next read re-parses the
+/// configuration. Called by [`crate::daemon`] after a successful install or
+/// uninstall: without it the store would keep showing the pre-install state
+/// for up to [`INSTALLED_CACHE_TTL`].
+pub fn invalidate_installed() {
+    installed_cache().clear();
 }
 
 /// Resolve every module concurrently (bounded) instead of one at a time —
@@ -116,18 +206,15 @@ impl Store {
 
     async fn search_packages(&self, query: &str, max: u32) -> zbus::fdo::Result<Vec<Dict>> {
         let key = ("pkg", query.to_string(), max);
-        let entries = search_cache()
+        // Cached *before* dedup: which variant represents a group depends on
+        // what is installed, which the cached value must not freeze in.
+        let mut entries = search_cache()
             .get_or_fetch(key, || async move {
                 match NixPackage::search_scored(query, max).await {
-                    Ok(pkgs) => {
-                        // Score before dedup: `dedup_by_group` keeps the first
-                        // entry per group and relies on relevance order.
-                        let scored: Vec<AppEntry> = pkgs
-                            .iter()
-                            .map(|(score, pkg)| package_entry(pkg, *score))
-                            .collect();
-                        dedup_by_group(scored)
-                    }
+                    Ok(pkgs) => pkgs
+                        .iter()
+                        .map(|(score, pkg)| package_entry(pkg, *score))
+                        .collect(),
                     Err(e) => {
                         tracing::warn!(error = %e, query, "search_packages");
                         Vec::new()
@@ -135,12 +222,16 @@ impl Store {
                 }
             })
             .await;
+        stamp_installed(&mut entries).await;
+        // Relevance order is still what `dedup_by_group` falls back on when no
+        // variant of a group is installed.
+        let entries = dedup_by_group(entries);
         Ok(entries.into_iter().map(AppEntry::into_dict).collect())
     }
 
     async fn search_modules(&self, query: &str, max: u32) -> zbus::fdo::Result<Vec<Dict>> {
         let key = ("mod", query.to_string(), max);
-        let entries = search_cache()
+        let mut entries = search_cache()
             .get_or_fetch(key, || async move {
                 let scored = match ModuleInfo::search_scored(query, max).await {
                     Ok(scored) => scored,
@@ -158,27 +249,41 @@ impl Store {
                     .collect()
             })
             .await;
+        stamp_installed(&mut entries).await;
         Ok(entries.into_iter().map(AppEntry::into_dict).collect())
     }
 
     async fn list_installed_packages(&self) -> zbus::fdo::Result<Vec<Dict>> {
         let pkgs = tokio::task::spawn_blocking(|| {
-            install_package::list_installed_package(CONFIG_DIRECTORY)
+            install_package::list_installed_package(crate::config_dir::config_dir())
         })
         .await
         .map_err(|e| zbus::fdo::Error::Failed(format!("list_installed_packages: join: {e}")))?;
         let pkgs = to_result(pkgs, "list_installed_packages")?;
-        let entries = dedup_by_group(pkgs.iter().map(|p| package_entry(p, 0)).collect());
+        // Everything on this path is installed by definition — no need for
+        // `stamp_installed`, but the flag still has to be set before
+        // `dedup_by_group` reads it.
+        let mut entries: Vec<AppEntry> = pkgs.iter().map(|p| package_entry(p, 0)).collect();
+        for entry in &mut entries {
+            entry.installed = true;
+        }
+        let entries = dedup_by_group(entries);
         Ok(entries.into_iter().map(AppEntry::into_dict).collect())
     }
 
     async fn list_installed_modules(&self) -> zbus::fdo::Result<Vec<Dict>> {
         let modules = to_result(
-            install_module::list_installed_modules(CONFIG_DIRECTORY).await,
+            install_module::list_installed_modules(crate::config_dir::config_dir()).await,
             "list_installed_modules",
         )?;
         resolve_all(&modules).await;
-        let entries: Vec<AppEntry> = modules.iter().map(|m| module_entry(m, 0)).collect();
+        let entries: Vec<AppEntry> = modules
+            .iter()
+            .map(|m| AppEntry {
+                installed: true,
+                ..module_entry(m, 0)
+            })
+            .collect();
         Ok(entries.into_iter().map(AppEntry::into_dict).collect())
     }
 
@@ -310,6 +415,7 @@ impl Store {
         let mut entries = alt_cache()
             .get_or_fetch(key, || build_alt_entries(gid, table_attrs))
             .await;
+        stamp_installed(&mut entries).await;
         entries.sort_by(|a, b| alt_sort_key(a).cmp(&alt_sort_key(b)));
         Ok(entries.into_iter().map(AppEntry::into_dict).collect())
     }
@@ -362,6 +468,7 @@ async fn build_alt_entries(gid: String, table_attrs: &'static [&'static str]) ->
             flatpak_preferred,
             variant_rank: variant_rank(attr, base),
             score: 0,
+            installed: false,
         }));
     } else if !gid.contains('.') {
         let pkgs = NixPackage::search(&gid, MAX_VARIANT_SEARCH)
@@ -384,6 +491,7 @@ async fn build_alt_entries(gid: String, table_attrs: &'static [&'static str]) ->
                 flatpak_preferred: false,
                 variant_rank: variant_rank(attr, &gid),
                 score: 0,
+                installed: false,
             }
         }));
     }
@@ -403,5 +511,46 @@ mod tests {
         )
         .await;
         let _dicts: Vec<Dict> = entries.into_iter().map(AppEntry::into_dict).collect();
+    }
+
+    fn entry(name: &str, kind: &'static str) -> AppEntry {
+        AppEntry {
+            name: name.to_string(),
+            base_name: name.to_string(),
+            pname: name.to_string(),
+            app_name: None,
+            summary: String::new(),
+            version: String::new(),
+            app_id: None,
+            group_id: None,
+            icon: None,
+            icon_name: None,
+            kind,
+            flatpak_preferred: false,
+            variant_rank: 0,
+            score: 0,
+            installed: false,
+        }
+    }
+
+    #[test]
+    fn installed_sets_match_per_kind() {
+        let sets = InstalledSets {
+            packages: ["htop".to_string()].into_iter().collect(),
+            modules: ["audio".to_string()].into_iter().collect(),
+        };
+        assert!(sets.contains(&entry("htop", "package")));
+        assert!(sets.contains(&entry("audio", "module")));
+        // A module and a package may share a name without sharing a state.
+        assert!(!sets.contains(&entry("audio", "package")));
+        assert!(!sets.contains(&entry("htop", "module")));
+    }
+
+    #[test]
+    fn into_dict_always_carries_installed() {
+        // The client must be able to tell "not installed" from "absent field"
+        // (see `AppEntry::installed`), so `false` has to be on the wire too.
+        let dict = entry("htop", "package").into_dict();
+        assert!(dict.contains_key("installed"));
     }
 }

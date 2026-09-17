@@ -49,7 +49,17 @@ impl Daemon {
             .find(|command| command.name() == name)
             .ok_or_else(|| zbus::fdo::Error::UnknownMethod(name.to_string()))?;
 
-        command.execute(arguments).await.map_err(Into::into)
+        let result = command.execute(arguments).await;
+
+        // Every write here changes what `Store1` reports as installed, and its
+        // cached listing would otherwise keep serving the pre-write answer for
+        // up to `INSTALLED_CACHE_TTL` — long enough for GNOME Software to show
+        // "Install" again on the app it has just installed.
+        if result.is_ok() && (name.starts_with("Install") || name.starts_with("Uninstall")) {
+            crate::store::invalidate_installed();
+        }
+
+        result.map_err(Into::into)
     }
 }
 

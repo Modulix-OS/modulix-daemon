@@ -7,7 +7,7 @@
     flake-utils.url = "github:numtide/flake-utils";
 
     modulix-core-utils = {
-      url = "git+file:///home/quentin/Programmes/Modulix-OS/modulix-core-utils";
+      url = "github:Modulix-OS/modulix-core-utils";
       flake = false;
     };
   };

@@ -21,25 +21,22 @@
     "modulix-core-utils": {
       "flake": false,
       "locked": {
-        "dirtyRev": "06190ff27600b68e3f887f282a1c7b11bb5075a5-dirty",
-        "dirtyShortRev": "06190ff-dirty",
-        "lastModified": 1789674432,
-        "narHash": "sha256-vM9nsyDCrZoBiloPDNGYwSKZlZCiWgwHOU5kt6tA7wU=",
-        "type": "git",
-        "url": "file:///home/quentin/Programmes/Modulix-OS/modulix-core-utils"
+        "path": "github:modulix-core-utils",
+        "type": "path"
       },
       "original": {
-        "type": "git",
-        "url": "file:///home/quentin/Programmes/Modulix-OS/modulix-core-utils"
-      }
+        "path": "github:modulix-core-utils",
+        "type": "path"
+      },
+      "parent": []
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1781216227,
-        "narHash": "sha256-9mUW6gNwoN2SWc/l0fW4svPNOulXLl8ijqKyeSOGgJE=",
+        "lastModified": 1789542786,
+        "narHash": "sha256-ajQuqcxnj6RYnwCjA/9FTCnrdR2+BDzstE8UembXf60=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "a0374025a863d007d98e3297f6aa46cc3141c2f0",
+        "rev": "4c7870105e7f1fdf9c48688c8d7efc21abf0688a",
         "type": "github"
       },
       "original": {

@@ -41,6 +41,11 @@ const ALT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const ENRICH_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const PLUGINS_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
+/// Ceiling on `nix eval` invocations a single `GetPackageLicenses` call may
+/// trigger. GNOME Software asks for a license on the details page (one app),
+/// so this only bounds a pathological caller passing a whole search page.
+const MAX_LICENSE_EVALS: usize = 16;
+
 /// Timeout budget for the best-effort Modulix-module lookup prepended to the
 /// alternate-of list: this runs on every details-page open, so a
 /// slow/unreachable module index must not stall the whole popover.
@@ -57,6 +62,7 @@ static SEARCH_CACHE: OnceLock<FlightCache<SearchKey, Vec<AppEntry>>> = OnceLock:
 static ALT_CACHE: OnceLock<FlightCache<String, Vec<AppEntry>>> = OnceLock::new();
 static ENRICH_CACHE: OnceLock<FlightCache<String, Option<EnrichEntry>>> = OnceLock::new();
 static PLUGINS_CACHE: OnceLock<FlightCache<String, Vec<PluginEntry>>> = OnceLock::new();
+static LICENSE_CACHE: OnceLock<FlightCache<String, Option<String>>> = OnceLock::new();
 
 fn search_cache() -> &'static FlightCache<SearchKey, Vec<AppEntry>> {
     SEARCH_CACHE.get_or_init(|| FlightCache::new(SEARCH_CACHE_TTL, CACHE_CAP))
@@ -72,6 +78,11 @@ fn enrich_cache() -> &'static FlightCache<String, Option<EnrichEntry>> {
 
 fn plugins_cache() -> &'static FlightCache<String, Vec<PluginEntry>> {
     PLUGINS_CACHE.get_or_init(|| FlightCache::new(PLUGINS_CACHE_TTL, CACHE_CAP))
+}
+
+/// Licenses change only when nixpkgs does: same generous TTL as enrichment.
+fn license_cache() -> &'static FlightCache<String, Option<String>> {
+    LICENSE_CACHE.get_or_init(|| FlightCache::new(ENRICH_CACHE_TTL, CACHE_CAP))
 }
 
 /// Resolve every module concurrently (bounded) instead of one at a time —
@@ -232,6 +243,48 @@ impl Store {
         Ok(out)
     }
 
+    /// SPDX expression per nixpkgs attribute, for the attributes that have
+    /// one (others are simply absent from the reply).
+    ///
+    /// Costs one `nix eval` per uncached attribute
+    /// ([`package_info::license_for_package`]), so at most
+    /// [`MAX_LICENSE_EVALS`] of them are evaluated per call — the rest are
+    /// served from the cache or omitted. In practice a store only asks for
+    /// the license of the app whose details page is open.
+    async fn get_package_licenses(
+        &self,
+        attrs: Vec<&str>,
+    ) -> zbus::fdo::Result<HashMap<String, String>> {
+        let missing: Vec<String> = attrs
+            .iter()
+            .filter(|attr| license_cache().get_fresh(&attr.to_string()).is_none())
+            .take(MAX_LICENSE_EVALS)
+            .map(|attr| attr.to_string())
+            .collect();
+
+        if !missing.is_empty() {
+            let fetched: Vec<(String, Option<String>)> = stream::iter(missing)
+                .map(|attr| async move {
+                    let license = package_info::license_for_package(&attr).await;
+                    (attr, license)
+                })
+                .buffer_unordered(CONCURRENCY_LIMIT)
+                .collect()
+                .await;
+            for (attr, license) in fetched {
+                license_cache().insert(attr, license);
+            }
+        }
+
+        let mut out = HashMap::new();
+        for attr in attrs {
+            if let Some(Some(license)) = license_cache().get_fresh(&attr.to_string()) {
+                out.insert(attr.to_string(), license);
+            }
+        }
+        Ok(out)
+    }
+
     async fn packages_for_app_id(&self, app_id: &str) -> zbus::fdo::Result<Vec<Dict>> {
         // A `.desktop`-suffixed id absent from the curated table is retried
         // bare (some callers pass the desktop-file id, not the AppStream id).
@@ -273,6 +326,7 @@ async fn fetch_enrichment(app_id: &str) -> Option<EnrichEntry> {
         screenshots: collect_screenshots(info.screenshots()),
         icon: (!icon.is_empty()).then(|| icon.to_string()),
         icon_name: icon_name_for_app_id(app_id).map(str::to_string),
+        license: info.license(),
     })
 }
 

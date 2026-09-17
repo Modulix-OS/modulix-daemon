@@ -112,6 +112,8 @@ pub struct EnrichEntry {
     /// Flathub AppStream icon URL.
     pub icon: Option<String>,
     pub icon_name: Option<String>,
+    /// SPDX expression (or an AppStream `LicenseRef-*`) for the app.
+    pub license: Option<String>,
 }
 
 impl EnrichEntry {
@@ -128,6 +130,9 @@ impl EnrichEntry {
         }
         if let Some(icon_name) = self.icon_name {
             d.insert("icon_name".into(), ov(icon_name));
+        }
+        if let Some(license) = self.license {
+            d.insert("license".into(), ov(license));
         }
         d
     }

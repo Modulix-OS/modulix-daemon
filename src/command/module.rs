@@ -24,12 +24,9 @@ impl Command for InstallModule {
 
         if !crate::dry_run::is_dry_run() {
             for name in arguments {
-                modulix_core_utils::install_module::install(
-                    modulix_core_utils::CONFIG_DIRECTORY,
-                    name,
-                )
-                .await
-                .map_err(|e| Error::CoreUtils(e.to_string()))?;
+                modulix_core_utils::install_module::install(crate::config_dir::config_dir(), name)
+                    .await
+                    .map_err(|e| Error::CoreUtils(e.to_string()))?;
             }
         }
 
@@ -52,7 +49,7 @@ impl Command for UninstallModule {
         if !crate::dry_run::is_dry_run() {
             for name in arguments {
                 modulix_core_utils::install_module::uninstall(
-                    modulix_core_utils::CONFIG_DIRECTORY,
+                    crate::config_dir::config_dir(),
                     name,
                 )
                 .await

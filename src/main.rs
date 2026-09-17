@@ -7,6 +7,7 @@
 
 mod cache;
 mod command;
+mod config_dir;
 mod daemon;
 mod dry_run;
 mod error;

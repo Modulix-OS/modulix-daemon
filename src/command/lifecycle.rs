@@ -34,7 +34,7 @@ macro_rules! lifecycle_commands {
                     let owned: Vec<String> = arguments.iter().map(|s| s.to_string()).collect();
                     tokio::task::spawn_blocking(move || {
                         let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-                        $install_fn(modulix_core_utils::CONFIG_DIRECTORY, &refs)
+                        $install_fn($crate::config_dir::config_dir(), &refs)
                     })
                     .await
                     .map_err(|e| Error::CoreUtils(e.to_string()))?
@@ -62,7 +62,7 @@ macro_rules! lifecycle_commands {
                     let owned: Vec<String> = arguments.iter().map(|s| s.to_string()).collect();
                     tokio::task::spawn_blocking(move || {
                         let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-                        $uninstall_fn(modulix_core_utils::CONFIG_DIRECTORY, &refs)
+                        $uninstall_fn($crate::config_dir::config_dir(), &refs)
                     })
                     .await
                     .map_err(|e| Error::CoreUtils(e.to_string()))?

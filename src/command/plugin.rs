@@ -41,7 +41,7 @@ impl Command for InstallPlugin {
         if !crate::dry_run::is_dry_run() {
             let namespace = plugin_namespace(module).await?;
             modulix_core_utils::install_module::install_plugin(
-                modulix_core_utils::CONFIG_DIRECTORY,
+                crate::config_dir::config_dir(),
                 module,
                 &namespace,
                 plugin,
@@ -73,7 +73,7 @@ impl Command for UninstallPlugin {
         if !crate::dry_run::is_dry_run() {
             let namespace = plugin_namespace(module).await?;
             modulix_core_utils::install_module::remove_plugin(
-                modulix_core_utils::CONFIG_DIRECTORY,
+                crate::config_dir::config_dir(),
                 module,
                 &namespace,
                 plugin,

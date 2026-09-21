@@ -17,6 +17,43 @@
 //! LUKS device whose mapper comes up with its `fstab` entry already in place
 //! — are reported as a mount, since that configuration did appear while we
 //! were watching.
+//!
+//! # Subscriptions
+//! [`Udisks2Listener::listen`] subscribes to the `org.freedesktop.UDisks2`
+//! [`ObjectManagerProxy`]'s `InterfacesAdded`/`InterfacesRemoved` signals at
+//! `/org/freedesktop/UDisks2`, to start/stop watching a device as its
+//! `Filesystem` interface appears/disappears. Each watched device additionally
+//! gets its own `tokio` task (spawned by `Watchers::spawn`, running
+//! `watch_configuration`) subscribed to the `PropertiesChanged` signal for its
+//! `Block.Configuration` property.
+//!
+//! # Reporting and blocking
+//! Every reported mount/unmount/options-change event is handed off to the
+//! external library (currently stubbed as a log line plus, in release
+//! builds, a `println!`; see `mount_info`). Once wired to the real library,
+//! that call edits the NixOS configuration and runs `nixos-rebuild`, which
+//! blocks for minutes; that call happens synchronously on the per-device
+//! watcher task, so only that device's task is blocked for the duration —
+//! other devices' watcher tasks run independently and keep processing their
+//! own events.
+//!
+//! # No debouncing or coalescing
+//! `Configuration` changes are read one at a time, in the order the D-Bus
+//! signal stream delivers them (`while let Some(change) =
+//! configuration_changes.next().await` in `watch_configuration`). A change
+//! that arrives while the previous one is still being processed is not
+//! dropped or merged with it: it queues up in the signal stream's internal
+//! buffer and is picked up, and reported, on the next loop iteration, once
+//! the current one has finished — including its (blocking, once wired)
+//! library call.
+//!
+//! # UDisks2 not running
+//! [`Udisks2Listener::listen`] fetches the initial device list with
+//! `get_managed_objects` right after building the [`ObjectManagerProxy`]. If
+//! `org.freedesktop.UDisks2` cannot be reached at that point, this call fails
+//! and its error is propagated out of `listen` immediately: the listener
+//! never starts watching any device and the
+//! `InterfacesAdded`/`InterfacesRemoved` subscription is never set up.
 
 mod mount_info;
 mod proxies;
@@ -36,19 +73,57 @@ use crate::error::Error;
 use mount_info::MountInfo;
 use proxies::BlockProxy;
 
+/// D-Bus service name this listener watches.
 const SERVICE: &str = "org.freedesktop.UDisks2";
+/// Object path of the `org.freedesktop.DBus.ObjectManager` queried for the
+/// initial device list and subscribed to for
+/// `InterfacesAdded`/`InterfacesRemoved`.
 const MANAGER_PATH: &str = "/org/freedesktop/UDisks2";
+/// Interface a device must expose for its `Block.Configuration` to be
+/// watched; its presence/absence in `InterfacesAdded`/`InterfacesRemoved` is
+/// what starts/stops that device's `watch_configuration` task.
 const FILESYSTEM_INTERFACE: &str = "org.freedesktop.UDisks2.Filesystem";
 
 /// Listener for `org.freedesktop.UDisks2`.
+///
+/// Zero-sized: all state lives in the `Connection` passed to
+/// [`Listener::listen`] and in the `Watchers` created for the duration of
+/// that call.
 pub struct Udisks2Listener;
 
 #[async_trait]
 impl Listener for Udisks2Listener {
+    /// Returns `"udisks2"`, this listener's identifier used in logs.
     fn name(&self) -> &'static str {
         "udisks2"
     }
 
+    /// Subscribes to `org.freedesktop.UDisks2`'s `ObjectManager`, starts
+    /// watching every already-present device exposing a `Filesystem`
+    /// interface, then keeps watching devices as they gain/lose that
+    /// interface for as long as `connection` stays open.
+    ///
+    /// # Parameters
+    /// * `connection` - system bus connection to subscribe on.
+    ///
+    /// # Pre-conditions
+    /// `org.freedesktop.UDisks2` must be reachable on `connection`'s bus: the
+    /// initial `get_managed_objects` call is not retried.
+    ///
+    /// # Post-conditions
+    /// Only returns if `connection` closes or a signal subscription/decoding
+    /// fails; otherwise loops forever over `InterfacesAdded`/
+    /// `InterfacesRemoved`, starting or stopping a `watch_configuration` task
+    /// (via `Watchers`) as each device's `Filesystem` interface
+    /// appears/disappears.
+    ///
+    /// # Errors
+    /// Returns immediately with an error if the `ObjectManagerProxy` cannot
+    /// be built, if the initial `get_managed_objects` call fails (e.g.
+    /// `org.freedesktop.UDisks2` is not running/reachable), or if
+    /// subscribing to `InterfacesAdded`/`InterfacesRemoved` fails. Once the
+    /// loop is running, a failure to decode a received signal's arguments
+    /// also ends `listen` with that error.
     async fn listen(&self, connection: Connection) -> Result<(), Error> {
         let object_manager = ObjectManagerProxy::builder(&connection)
             .destination(SERVICE)?
@@ -100,7 +175,13 @@ impl Listener for Udisks2Listener {
 /// Per-object watcher tasks for `Block.Configuration`, keyed by object path
 /// so they can be aborted when the device disappears.
 #[derive(Default, Clone)]
-struct Watchers(Arc<Mutex<HashMap<OwnedObjectPath, JoinHandle<()>>>>);
+struct Watchers(
+    /// Map from a watched device's object path to the `tokio` task running
+    /// `watch_configuration` for it. Shared (`Arc<Mutex<_>>`) so the same
+    /// `Watchers` handle can be cloned into the signal-handling loop while
+    /// still being read/written from both `spawn` and `remove`.
+    Arc<Mutex<HashMap<OwnedObjectPath, JoinHandle<()>>>>,
+);
 
 impl Watchers {
     /// Spawn a watcher for `path`, aborting any previous watcher for the same path.
@@ -110,6 +191,23 @@ impl Watchers {
     /// (already configured, not a new event), `true` for devices that just
     /// appeared via `InterfacesAdded` (already configured counts as a
     /// configuration that happened just now).
+    ///
+    /// # Parameters
+    /// * `connection` - system bus connection the spawned task uses to watch
+    ///   `path` and, when reporting a mount, to query the device.
+    /// * `path` - object path of the device to watch.
+    /// * `report_initial_config` - as described above.
+    ///
+    /// # Post-conditions
+    /// A `watch_configuration` task for `path` is running, replacing any
+    /// previous one registered for the same `path`, which is aborted. A task
+    /// that later fails (any `Err` from `watch_configuration`, e.g. a lost
+    /// D-Bus connection) logs the error and exits; it is not restarted or
+    /// removed from this map by itself.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned (a previous holder panicked
+    /// while holding the lock).
     fn spawn(&self, connection: &Connection, path: OwnedObjectPath, report_initial_config: bool) {
         let connection = connection.clone();
         let task_path = path.clone();
@@ -127,6 +225,19 @@ impl Watchers {
     }
 
     /// Abort and drop the watcher for `path`, if any.
+    ///
+    /// # Parameters
+    /// * `path` - object path whose watcher must stop.
+    ///
+    /// # Post-conditions
+    /// No watcher task remains registered for `path`; its `watch_configuration`
+    /// task is aborted immediately (no graceful shutdown, no final report for
+    /// whatever change it may have been mid-processing). A `path` with no
+    /// registered watcher is a no-op.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned (a previous holder panicked
+    /// while holding the lock).
     fn remove(&self, path: &OwnedObjectPath) {
         if let Some(handle) = self.0.lock().expect("lock poisoned").remove(path) {
             handle.abort();
@@ -136,6 +247,39 @@ impl Watchers {
 
 /// Watch `Block.Configuration` at `path` and report every `fstab` entry add,
 /// removal, mount point change and mount options change.
+///
+/// # Parameters
+/// * `connection` - system bus connection used to build the `BlockProxy` for
+///   `path` and to subscribe to its `Configuration` property changes.
+/// * `path` - object path of the device to watch; the cleartext mapper
+///   device path for an unlocked LUKS partition, the plain block device path
+///   otherwise.
+/// * `report_initial_config` - if `true`, an already-configured `fstab` entry
+///   found on the very first `Configuration` value read is reported as a
+///   mount (device just appeared via `InterfacesAdded`); if `false`, it is
+///   only recorded as the current baseline and not reported (device was
+///   already present when the listener started).
+///
+/// # Returns
+/// `Ok(())` once the `Configuration` change stream ends (e.g. the D-Bus
+/// connection closes) without any of the errors below occurring.
+///
+/// # Post-conditions
+/// Runs for as long as the `Configuration` property-change stream keeps
+/// yielding, processing one change at a time: gathering `MountInfo` and
+/// reporting a mount/unmount/options-change to the external library are
+/// awaited in full before the next change is read off the stream, so changes
+/// are neither debounced nor coalesced — one arriving mid-processing is
+/// simply queued in the stream and handled on the next iteration. A failure
+/// to *report* a mount (`mount_info::report_mount` returning `Err`) is only
+/// logged: it does not stop the loop, and `current` is still updated to the
+/// new entry as if the report had succeeded.
+///
+/// # Errors
+/// Propagates any error from building the `BlockProxy`, from reading a
+/// `Configuration` change's value, or from `mount_info::gather`. Any such
+/// error ends the watch for `path` (the caller, `Watchers::spawn`, logs it
+/// and does not restart the task).
 async fn watch_configuration(
     connection: &Connection,
     path: &OwnedObjectPath,

@@ -21,14 +21,18 @@
     "modulix-core-utils": {
       "flake": false,
       "locked": {
-        "path": "github:modulix-core-utils",
-        "type": "path"
+        "lastModified": 1789686118,
+        "narHash": "sha256-dENCpEaAeUpv5avrSQQJd19m1lEfyBuzgShVEdxQTbQ=",
+        "owner": "Modulix-OS",
+        "repo": "modulix-core-utils",
+        "rev": "ae8a21a01124b987d39ab4e56c7d97a777931059",
+        "type": "github"
       },
       "original": {
-        "path": "github:modulix-core-utils",
-        "type": "path"
-      },
-      "parent": []
+        "owner": "Modulix-OS",
+        "repo": "modulix-core-utils",
+        "type": "github"
+      }
     },
     "nixpkgs": {
       "locked": {

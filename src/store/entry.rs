@@ -183,6 +183,11 @@ pub struct PluginEntry {
     /// present; the C consumer falls back to a default only when the key is
     /// absent (pre-this-field daemon).
     pub installed: bool,
+    /// Module the plugin belongs to. Bus key `"module"`, zvariant `s`.
+    /// Emitted only on the installed-plugins listing, where a row is not
+    /// scoped by the call argument; `None` (key absent) on
+    /// `ListModulePlugins`.
+    pub module: Option<String>,
 }
 
 impl PluginEntry {
@@ -194,13 +199,72 @@ impl PluginEntry {
     ///
     /// # Returns
     /// A [`Dict`] with `"name"`, `"description"` and `"installed"` always
-    /// present (no field of `PluginEntry` is optional).
+    /// present; `"module"` present only when `self.module` is `Some`.
     pub fn into_dict(self) -> Dict {
         let mut d = Dict::new();
         d.insert("name".into(), ov(self.name));
         d.insert("description".into(), ov(self.description));
         d.insert("installed".into(), ov(self.installed));
+        if let Some(module) = self.module {
+            d.insert("module".into(), ov(module));
+        }
         d
+    }
+}
+
+/// One flake input whose upstream revision has moved past the one pinned in
+/// `flake.lock`, store-side and bus-neutral. Serialized to a D-Bus `a{sv}`
+/// dict by [`Self::into_dict`]; read back client-side to build the "Modulix
+/// OS" `GsApp`'s update-details text
+/// (`gnome-software-plugin/plugin/src/gs-modulix-update.c`).
+#[derive(Clone)]
+pub struct InputEntry {
+    /// Flake input's attribute name, as declared under `inputs` in
+    /// `flake.nix`. Bus key `"input"`, zvariant `s`. Always present.
+    pub input: String,
+    /// Revision (or, lacking one, the `narHash`) currently pinned in
+    /// `flake.lock`. Bus key `"current_rev"`, zvariant `s`. Always present.
+    pub current_rev: String,
+    /// Revision (or `narHash`) available upstream. Bus key `"new_rev"`,
+    /// zvariant `s`. Always present.
+    pub new_rev: String,
+    /// Upstream revision's timestamp, Unix seconds. Bus key
+    /// `"last_modified"`, zvariant `t`. Always present.
+    pub last_modified: u64,
+}
+
+impl InputEntry {
+    /// Serializes `self` into the `a{sv}` [`Dict`] sent over
+    /// `org.modulix.Store1` for the outdated-inputs listing.
+    ///
+    /// # Parameters
+    /// None beyond `self`, consumed by value.
+    ///
+    /// # Returns
+    /// A [`Dict`] with `"input"`, `"current_rev"`, `"new_rev"` and
+    /// `"last_modified"` always present.
+    pub fn into_dict(self) -> Dict {
+        let mut d = Dict::new();
+        d.insert("input".into(), ov(self.input));
+        d.insert("current_rev".into(), ov(self.current_rev));
+        d.insert("new_rev".into(), ov(self.new_rev));
+        d.insert("last_modified".into(), ov(self.last_modified));
+        d
+    }
+}
+
+impl From<modulix_core_utils::update::OutdatedInput> for InputEntry {
+    /// Converts the library's plain struct into the bus-serializable entry.
+    ///
+    /// # Returns
+    /// An [`InputEntry`] with each field copied verbatim from `value`.
+    fn from(value: modulix_core_utils::update::OutdatedInput) -> Self {
+        InputEntry {
+            input: value.name,
+            current_rev: value.current_rev,
+            new_rev: value.new_rev,
+            last_modified: value.last_modified,
+        }
     }
 }
 

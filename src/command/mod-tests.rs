@@ -12,6 +12,7 @@ fn registry_contains_package_commands() {
             "UninstallModule",
             "InstallPlugin",
             "UninstallPlugin",
+            "UpdateSystem",
         ]
     );
 }

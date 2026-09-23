@@ -19,6 +19,7 @@ modulix-core-utils = { path = "../modulix-core-utils", features = [
     "module-info",
     "install-package",
     "install-module",
+    "system-update",
 ] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "signal"] }

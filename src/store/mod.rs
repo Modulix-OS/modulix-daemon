@@ -22,9 +22,9 @@ use modulix_core_utils::{
 
 use crate::cache::FlightCache;
 use entry::{
-    AppEntry, Dict, EnrichEntry, PluginEntry, alt_sort_key, base_attr, collect_screenshots,
-    dedup_by_group, icon_base_name, icon_name_for_app_id, module_entry, module_rows_for_app_id,
-    package_entry, variant_label, variant_rank,
+    AppEntry, Dict, EnrichEntry, InputEntry, PluginEntry, alt_sort_key, base_attr,
+    collect_screenshots, dedup_by_group, icon_base_name, icon_name_for_app_id, module_entry,
+    module_rows_for_app_id, package_entry, variant_label, variant_rank,
 };
 
 /// Cap shared by every cache in this module: one entry per distinct query/
@@ -67,6 +67,15 @@ const PLUGINS_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 /// back (the `mx` CLI, a hand-edited `package.nix`). Writes that go *through*
 /// the daemon don't wait for it — they call [`invalidate_installed`].
 const INSTALLED_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// TTL of [`UPDATE_CACHE`]: how long an outdated-inputs listing is served
+/// from cache before [`Store::list_outdated_inputs`] re-probes every flake
+/// input's upstream revision. An hour, since each probe is a `nix flake
+/// metadata` network round-trip per input — a caller wanting a fresher
+/// answer passes `force_refresh: true` rather than waiting this out (see
+/// `Store::list_outdated_inputs`). A completed `UpdateSystem` call also
+/// clears this early via [`invalidate_updates`].
+const UPDATE_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Ceiling on `nix eval` invocations a single `GetPackageLicenses` call may
 /// trigger. GNOME Software asks for a license on the details page (one app),
@@ -119,6 +128,10 @@ static LICENSE_CACHE: OnceLock<FlightCache<String, Option<String>>> = OnceLock::
 /// — there is only ever one system configuration to describe) — see
 /// [`installed_cache`].
 static INSTALLED_CACHE: OnceLock<FlightCache<(), Arc<InstalledSets>>> = OnceLock::new();
+/// Single-flight, TTL'd cache of the outdated-inputs listing, with a single
+/// key (`()` — there is only ever one `flake.lock` to describe) — see
+/// [`update_cache`].
+static UPDATE_CACHE: OnceLock<FlightCache<(), Arc<Vec<InputEntry>>>> = OnceLock::new();
 /// Key = module name, value = the **bare** plugin names (last component of
 /// each `pkgs.<namespace>.<plugin>` token) currently listed under
 /// `mx.<module>.plugins`. Matching by bare name rather than the full token
@@ -127,6 +140,14 @@ static INSTALLED_CACHE: OnceLock<FlightCache<(), Arc<InstalledSets>>> = OnceLock
 /// namespace than the module's own would false-positive here, an accepted
 /// trade-off.
 static INSTALLED_PLUGINS_CACHE: OnceLock<FlightCache<String, Arc<HashSet<String>>>> =
+    OnceLock::new();
+/// `(module, bare_plugin_name)` pair, the element of [`INSTALLED_PLUGINS_ALL_CACHE`].
+type InstalledPluginPairs = Arc<Vec<(String, String)>>;
+/// Single-flight, TTL'd cache of every [`InstalledPluginPairs`] pair
+/// currently installed, across all enabled modules — same single-key
+/// rationale as [`INSTALLED_CACHE`]. Backs `Store1.ListInstalledPlugins`'s
+/// `module == ""` case.
+static INSTALLED_PLUGINS_ALL_CACHE: OnceLock<FlightCache<(), InstalledPluginPairs>> =
     OnceLock::new();
 
 /// The process-wide [`SEARCH_CACHE`], created with [`SEARCH_CACHE_TTL`] and
@@ -175,6 +196,12 @@ fn plugins_cache() -> &'static FlightCache<String, Vec<PluginEntry>> {
 /// out.
 fn installed_plugins_cache() -> &'static FlightCache<String, Arc<HashSet<String>>> {
     INSTALLED_PLUGINS_CACHE.get_or_init(|| FlightCache::new(INSTALLED_CACHE_TTL, CACHE_CAP))
+}
+
+/// Same single-key, cap-1 pattern as [`installed_cache`]: there is only ever
+/// one system configuration, so the cache needs exactly one slot.
+fn installed_plugins_all_cache() -> &'static FlightCache<(), InstalledPluginPairs> {
+    INSTALLED_PLUGINS_ALL_CACHE.get_or_init(|| FlightCache::new(INSTALLED_CACHE_TTL, 1))
 }
 
 /// The process-wide [`LICENSE_CACHE`], created with [`CACHE_CAP`] on first
@@ -235,6 +262,17 @@ impl InstalledSets {
 /// of the daemon.
 fn installed_cache() -> &'static FlightCache<(), Arc<InstalledSets>> {
     INSTALLED_CACHE.get_or_init(|| FlightCache::new(INSTALLED_CACHE_TTL, 1))
+}
+
+/// The process-wide [`UPDATE_CACHE`], created with [`UPDATE_CACHE_TTL`] on
+/// first access. Uses a cap of 1, same single-key rationale as
+/// [`installed_cache`].
+///
+/// # Returns
+/// A `'static` reference to the cache, shared by every caller for the life
+/// of the daemon.
+fn update_cache() -> &'static FlightCache<(), Arc<Vec<InputEntry>>> {
+    UPDATE_CACHE.get_or_init(|| FlightCache::new(UPDATE_CACHE_TTL, 1))
 }
 
 /// The cached installed sets. Behind an `Arc`: one search stamps hundreds of
@@ -347,6 +385,38 @@ async fn installed_plugins(module: &str) -> Arc<HashSet<String>> {
         .await
 }
 
+/// Every `(module, bare_plugin_name)` pair currently installed, across all
+/// enabled modules (see [`INSTALLED_PLUGINS_ALL_CACHE`]).
+///
+/// Backs `Store1.ListInstalledPlugins`, whether it asks for one module or
+/// every module — a single fetch here is filtered per call rather than
+/// re-reading the configuration per module, since
+/// `modulix_core_utils::install_module::list_installed_plugins` already
+/// walks every enabled module in one `module.nix` read.
+///
+/// # Returns
+/// The pairs from a fresh [`installed_plugins_all_cache`] read, or from the
+/// on-disk configuration on a cache miss. A parse failure is logged at
+/// `warn` and treated as empty rather than propagated.
+async fn installed_plugins_all() -> InstalledPluginPairs {
+    installed_plugins_all_cache()
+        .get_or_fetch((), || async {
+            let dir = crate::config_dir::config_dir();
+            let plugins =
+                tokio::task::spawn_blocking(move || install_module::list_installed_plugins(dir))
+                    .await
+                    .map_err(|e| tracing::warn!(error = %e, "installed_plugins_all: join"))
+                    .ok()
+                    .and_then(|r| {
+                        r.map_err(|e| tracing::warn!(error = %e, "installed_plugins_all"))
+                            .ok()
+                    })
+                    .unwrap_or_default();
+            Arc::new(plugins)
+        })
+        .await
+}
+
 /// Fills in [`PluginEntry::installed`] for a module's plugin listing. Same
 /// ordering rule as [`stamp_installed`]: after the [`plugins_cache`] read,
 /// never inside its fetch closure — that cache lives
@@ -372,13 +442,28 @@ async fn stamp_plugins_installed(module: &str, entries: &mut [PluginEntry]) {
 /// for up to [`INSTALLED_CACHE_TTL`].
 ///
 /// # Post-conditions
-/// Both [`INSTALLED_CACHE`] and [`INSTALLED_PLUGINS_CACHE`] are cleared —
+/// [`INSTALLED_CACHE`], [`INSTALLED_PLUGINS_CACHE`] and
+/// [`INSTALLED_PLUGINS_ALL_CACHE`] are all cleared —
 /// fresh entries included, not just expired ones — so the very next read on
 /// either path re-parses the on-disk configuration instead of serving a
 /// value already known to be stale.
 pub fn invalidate_installed() {
     installed_cache().clear();
     installed_plugins_cache().clear();
+    installed_plugins_all_cache().clear();
+}
+
+/// Drops the cached outdated-inputs listing, so the next
+/// `ListOutdatedInputs` re-probes every flake input's upstream revision.
+/// Called by [`crate::daemon`] after a successful `UpdateSystem`: without it
+/// the store would keep reporting the pre-update set of outdated inputs for
+/// up to [`UPDATE_CACHE_TTL`].
+///
+/// # Post-conditions
+/// [`UPDATE_CACHE`] is cleared unconditionally — a fresh entry included, not
+/// just an expired one.
+pub fn invalidate_updates() {
+    update_cache().clear();
 }
 
 /// Resolve every module concurrently (bounded) instead of one at a time —
@@ -677,6 +762,7 @@ impl Store {
                             name: p.name,
                             description: p.description,
                             installed: false,
+                            module: None,
                         })
                         .collect(),
                     Err(e) => {
@@ -688,6 +774,56 @@ impl Store {
             .await;
         stamp_plugins_installed(module, &mut plugins).await;
         Ok(plugins.into_iter().map(PluginEntry::into_dict).collect())
+    }
+
+    /// Serves `ListInstalledPlugins(s module) -> aa{sv}`: every plugin
+    /// currently installed, across one or all enabled modules — the listing
+    /// behind the "Installed" page's Add-ons section, as opposed to
+    /// [`Self::list_module_plugins`] which lists a single module's whole
+    /// catalogue (installed or not).
+    ///
+    /// Runs no `nix eval`: the pairs come from [`installed_plugins_all`]
+    /// (config-derived, 5s-cached, one `module.nix` read for every module at
+    /// once via `modulix_core_utils::install_module::list_installed_plugins`),
+    /// filtered down to `module` when non-empty; the description is a
+    /// best-effort read of an existing cache entry ([`plugins_cache`]`.get_fresh`,
+    /// never a fetch), so an uncached module's plugins are reported with an
+    /// empty description rather than triggering the (expensive) catalogue
+    /// evaluation.
+    ///
+    /// # Parameters
+    /// * `module` - when non-empty, restrict the listing to this module's
+    ///   installed plugins; when empty, cover every currently enabled
+    ///   module.
+    ///
+    /// # Returns
+    /// One row per installed plugin (`name`, `description`, `installed:
+    /// true`, `module`; see `entry::PluginEntry`), `description` empty when
+    /// the module's plugin catalogue is not already cached.
+    ///
+    /// # Errors
+    /// Never returns `Err`.
+    async fn list_installed_plugins(&self, module: &str) -> zbus::fdo::Result<Vec<Dict>> {
+        let all = installed_plugins_all().await;
+
+        let mut entries = Vec::new();
+        for (m, name) in all.iter() {
+            if !module.is_empty() && m != module {
+                continue;
+            }
+            let description = plugins_cache()
+                .get_fresh(m)
+                .and_then(|plugins| plugins.iter().find(|p| &p.name == name).cloned())
+                .map(|p| p.description)
+                .unwrap_or_default();
+            entries.push(PluginEntry {
+                name: name.clone(),
+                description,
+                installed: true,
+                module: Some(m.clone()),
+            });
+        }
+        Ok(entries.into_iter().map(PluginEntry::into_dict).collect())
     }
 
     /// Serves `GetAppEnrichment(as app_ids) -> a{sa{sv}}`: Flathub-sourced
@@ -870,6 +1006,55 @@ impl Store {
         stamp_installed(&mut entries).await;
         entries.sort_by(|a, b| alt_sort_key(a).cmp(&alt_sort_key(b)));
         Ok(entries.into_iter().map(AppEntry::into_dict).collect())
+    }
+
+    /// Serves `ListOutdatedInputs(b force_refresh) -> aa{sv}`: the direct
+    /// flake inputs whose upstream revision has moved past the one pinned in
+    /// `flake.lock` — what an `UpdateSystem` call would refresh.
+    ///
+    /// Served from [`UPDATE_CACHE`] when fresh ([`UPDATE_CACHE_TTL`], 1h;
+    /// single-flight across concurrent callers, same [`FlightCache`] pattern
+    /// as every other cache in this module). On a miss, probes every direct
+    /// input's upstream metadata via
+    /// [`modulix_core_utils::update::outdated_inputs`] — one `nix flake
+    /// metadata --refresh` network round-trip per input, sequential, each
+    /// bounded by that function's own per-input timeout; an input whose
+    /// probe fails is silently absent from the result rather than failing
+    /// the whole call (see that function's docs). A completed `UpdateSystem`
+    /// call invalidates this cache early (see [`invalidate_updates`]).
+    ///
+    /// # Parameters
+    /// * `force_refresh` - when `true`, the cache is cleared before the
+    ///   read, forcing a fresh probe of every input regardless of
+    ///   [`UPDATE_CACHE_TTL`] — what GNOME Software's `refresh_metadata_async`
+    ///   uses for an explicit user-requested refresh; a routine background
+    ///   check passes `false` and rides the cache.
+    ///
+    /// # Returns
+    /// One row per outdated direct input (see `entry::InputEntry`). An empty
+    /// array when every input is already current, or when `flake.lock`
+    /// cannot be read/parsed — not an error either way (see
+    /// [`modulix_core_utils::update::outdated_inputs`]).
+    ///
+    /// # Errors
+    /// Never returns `Err`.
+    async fn list_outdated_inputs(&self, force_refresh: bool) -> zbus::fdo::Result<Vec<Dict>> {
+        if force_refresh {
+            update_cache().clear();
+        }
+        let entries = update_cache()
+            .get_or_fetch((), || async {
+                let inputs =
+                    modulix_core_utils::update::outdated_inputs(crate::config_dir::config_dir())
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "list_outdated_inputs");
+                            Vec::new()
+                        });
+                Arc::new(inputs.into_iter().map(InputEntry::from).collect())
+            })
+            .await;
+        Ok(entries.iter().cloned().map(InputEntry::into_dict).collect())
     }
 }
 

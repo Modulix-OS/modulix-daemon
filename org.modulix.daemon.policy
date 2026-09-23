@@ -41,4 +41,21 @@
     </defaults>
   </action>
 
+  <action id="org.modulix.daemon.update">
+    <description>Refresh system inputs and rebuild the system</description>
+    <description
+            xml:lang="fr"
+        >Rafraîchir les entrées système et reconstruire le système</description>
+    <message>Authentication is required to update the system.</message>
+    <message
+            xml:lang="fr"
+        >Une authentification est requise pour mettre à jour le système.</message>
+
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+
 </policyconfig>

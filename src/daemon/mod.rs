@@ -36,7 +36,7 @@
 
 use crate::command::setting::{Setting, apply_list, apply_option};
 use crate::command::{self, Command};
-use crate::polkit::{self, ACTION_INSTALL, ACTION_REMOVE};
+use crate::polkit::{self, ACTION_INSTALL, ACTION_REMOVE, ACTION_UPDATE};
 
 /// Well-known bus name the daemon owns on the system bus.
 ///
@@ -111,6 +111,15 @@ impl Daemon {
     /// every command reachable through this path, since all of them are
     /// named `Install*`/`Uninstall*`.
     ///
+    /// On success of `"UpdateSystem"` specifically: `crate::store`'s outdated-
+    /// inputs cache is invalidated via `crate::store::invalidate_updates` (a
+    /// completed update should not keep reporting itself as outdated), and
+    /// the package index's nixpkgs fingerprint is invalidated with a
+    /// background refresh spawned (not awaited — same non-blocking shape as
+    /// `spawn_rebuild_signal_handler`'s SIGHUP handler in `src/main.rs`,
+    /// which this reuses) since a successful update moves nixpkgs out from
+    /// under the index.
+    ///
     /// # Errors
     /// Returns an error, and skips both execution and cache invalidation,
     /// when: the polkit check denies authorization or itself fails (caller
@@ -138,8 +147,14 @@ impl Daemon {
 
         let result = command.execute(arguments).await;
 
-        if result.is_ok() && (name.starts_with("Install") || name.starts_with("Uninstall")) {
-            crate::store::invalidate_installed();
+        if result.is_ok() {
+            if name.starts_with("Install") || name.starts_with("Uninstall") {
+                crate::store::invalidate_installed();
+            } else if name == "UpdateSystem" {
+                crate::store::invalidate_updates();
+                modulix_core_utils::package_index::invalidate_fingerprint();
+                tokio::spawn(modulix_core_utils::package_index::ensure_fresh_in_background());
+            }
         }
 
         result.map_err(Into::into)
@@ -435,6 +450,51 @@ impl Daemon {
             &[module, plugin],
         )
         .await
+    }
+
+    /// Refreshes every flake input and rebuilds the system.
+    ///
+    /// D-Bus signature: `UpdateSystem(s mode) -> (s)`.
+    ///
+    /// # Parameters
+    /// * `mode` - `"switch"` to rebuild and switch immediately (a
+    ///   user-triggered "Update Now"), or `"boot"` to only prepare the next
+    ///   boot (GNOME Software preparing an update in the background). See
+    ///   `crate::command::update` for how `mode` also decides the CPU-core
+    ///   cap on the rebuild.
+    ///
+    /// # Pre-conditions
+    /// The caller must be authorized for the [`ACTION_UPDATE`] polkit
+    /// action. Unlike [`ACTION_INSTALL`]/[`ACTION_REMOVE`], the policy
+    /// grants this to any active session with no `auth_admin` prompt, so a
+    /// background-prepared update can complete unattended.
+    ///
+    /// # Returns
+    /// `"system updated (switch)"` or `"system update prepared for next
+    /// boot"`, once the rebuild has completed.
+    ///
+    /// # Post-conditions
+    /// The call blocks for the whole `nix flake update` plus, if any input
+    /// actually moved, the whole `nixos-rebuild` — potentially **minutes**.
+    /// Unless [`crate::dry_run::is_dry_run`] is true (the default in debug
+    /// builds), a successful call also invalidates the outdated-inputs
+    /// cache and kicks off a background package-index refresh (see
+    /// `Daemon::run`).
+    ///
+    /// # Errors
+    /// A D-Bus error reply is returned, and no rebuild is attempted, if the
+    /// caller declines or is otherwise denied polkit authorization, or if
+    /// `mode` is neither `"switch"` nor `"boot"`. A D-Bus error reply is
+    /// also returned if the underlying `modulix-core-utils` call fails, in
+    /// which case the configuration is left unchanged.
+    async fn update_system(
+        &self,
+        mode: &str,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        self.run(connection, &header, ACTION_UPDATE, "UpdateSystem", &[mode])
+            .await
     }
 
     /// Applies scalar option and/or list-entry changes in a single call.

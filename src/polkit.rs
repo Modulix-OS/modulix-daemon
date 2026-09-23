@@ -57,6 +57,17 @@ pub const ACTION_INSTALL: &str = "org.modulix.daemon.install";
 /// `auth_admin` (see the module docs above).
 pub const ACTION_REMOVE: &str = "org.modulix.daemon.remove";
 
+/// polkit action id for `UpdateSystem`.
+///
+/// Matches the `id` attribute of its `<action>` in
+/// `org.modulix.daemon.policy`, which — unlike [`ACTION_INSTALL`]/
+/// [`ACTION_REMOVE`] — grants `allow_active="yes"` with no `auth_admin`
+/// prompt: a background update prepared by GNOME Software must be able to
+/// complete unattended. See that action's `<description>` for the accepted
+/// trade-off (any locally active user can trigger a rebuild, at CPU/disk
+/// cost and advancing every flake input, without an admin confirmation).
+pub const ACTION_UPDATE: &str = "org.modulix.daemon.update";
+
 /// Checks that the caller identified by `header` is authorized for
 /// `action_id`, prompting for authentication (polkit agent) if needed.
 ///

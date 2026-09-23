@@ -9,6 +9,7 @@ mod module;
 mod package;
 mod plugin;
 pub(crate) mod setting;
+mod update;
 
 use async_trait::async_trait;
 
@@ -16,6 +17,7 @@ use crate::error::Error;
 use module::{InstallModule, UninstallModule};
 use package::{InstallPackage, UninstallPackage};
 use plugin::{InstallPlugin, UninstallPlugin};
+pub use update::UpdateSystem;
 
 /// A single command handler for the `org.modulix.Daemon` interface.
 ///
@@ -64,10 +66,10 @@ pub trait Command: Send + Sync {
 /// # Returns
 /// One boxed [`Command`] per implementation currently wired up:
 /// `package::InstallPackage`/`package::UninstallPackage`,
-/// `module::InstallModule`/`module::UninstallModule`, and
-/// `plugin::InstallPlugin`/`plugin::UninstallPlugin`. Consumed by
-/// [`crate::daemon::Daemon::new`] to populate [`crate::daemon::Daemon`]'s
-/// command table.
+/// `module::InstallModule`/`module::UninstallModule`,
+/// `plugin::InstallPlugin`/`plugin::UninstallPlugin`, and
+/// `update::UpdateSystem`. Consumed by [`crate::daemon::Daemon::new`] to
+/// populate [`crate::daemon::Daemon`]'s command table.
 pub fn registry() -> Vec<Box<dyn Command>> {
     vec![
         Box::new(InstallPackage),
@@ -76,6 +78,7 @@ pub fn registry() -> Vec<Box<dyn Command>> {
         Box::new(UninstallModule),
         Box::new(InstallPlugin),
         Box::new(UninstallPlugin),
+        Box::new(UpdateSystem),
     ]
 }
 

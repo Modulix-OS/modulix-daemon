@@ -21,11 +21,11 @@
     "modulix-core-utils": {
       "flake": false,
       "locked": {
-        "lastModified": 1790166285,
-        "narHash": "sha256-XDLEOs7EX99xeV7Dx4a/pf2G2BWqqLh18vfh6y4hllc=",
+        "lastModified": 1790709474,
+        "narHash": "sha256-yk5FQ6hNxFCe/ABvX3zPK15kudsiwJ3lkGVbXaMAdBk=",
         "owner": "Modulix-OS",
         "repo": "modulix-core-utils",
-        "rev": "9e740ae84dabc79200de50b84d04707f6821fb6c",
+        "rev": "8bc8319402cf69676e2594366ca26f8c29ddf660",
         "type": "github"
       },
       "original": {

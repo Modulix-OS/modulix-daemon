@@ -53,3 +53,32 @@ Genericity via traits so new listened interfaces and new own-interface commands 
 - Use **zbus** as the DBus crate. Prefer `Arc<Mutex<T>>` for shared state (global rule).
 
 Adding work = add a new trait impl (listened interface) or a new interface method + handler (own interface); both funnel into the "info log → release-gated library call" pattern above.
+
+## System updates (`Store1.CheckUpdate` + `Daemon.UpdateSystem`)
+
+A NixOS system update is one transaction (`flake.lock` + `nixos-rebuild`), so
+the daemon splits it into a *search* and an *apply* that share one resolution:
+
+- `Store1.CheckUpdate() -> b` (`src/store/mod.rs`) calls
+  `modulix_core_utils::update::check_update`, which runs a full
+  `nix flake update --output-lock-file <scratch>` — **nothing in the config
+  directory is written**, so this stays on the unprivileged read interface. The
+  resulting candidate `flake.lock` is parked in `PENDING_LOCK`, a plain
+  `Mutex<Option<String>>` next to the `FlightCache` statics: no TTL, take-once
+  semantics, overwritten by the next check. Concurrent callers queue behind
+  `CHECK_GUARD` (a `tokio::sync::Mutex`) instead of each spawning a refresh.
+- The same call refills `UPDATE_CACHE` from `update::diff_locks`, a purely
+  local diff of the two lockfiles. So `ListOutdatedInputs` right after is free
+  and consistent by construction with what an update would apply, instead of
+  re-probing each input with `nix flake metadata`.
+- `Daemon.UpdateSystem(mode)` (`src/command/update.rs`) takes the candidate
+  with `store::take_pending_lock()` and writes it through
+  `update::update_with_lock` (`UpdateInput::UseLock`), so the revisions
+  installed are the ones the check announced. No candidate pending ⇒ it runs
+  the probe itself; nothing to apply ⇒ `"system already up to date"`, no
+  rebuild. The candidate is consumed either way — a failed rebuild does not put
+  it back, the next check recomputes it.
+
+`CheckUpdate` needs no polkit action (it is a `Store1` read) and no new
+`Command` impl, so `org.modulix.daemon.policy`, `org.modulix.Daemon.conf` and
+`command::registry()` are all untouched by it.

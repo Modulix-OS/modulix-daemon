@@ -15,6 +15,13 @@
 //! it, so it is capped to half the machine's cores, leaving the other half
 //! free for whatever the user is doing in the foreground.
 //!
+//! The refresh itself is *not* computed here: `Store1.CheckUpdate` already
+//! resolved a candidate `flake.lock` and parked it in RAM
+//! ([`crate::store::take_pending_lock`]), and this command writes that exact
+//! lockfile. So the revisions the user was shown are the revisions installed,
+//! and the network cost of resolving them is paid once rather than twice. A
+//! call arriving with no candidate pending runs the probe itself first.
+//!
 //! The library call is skipped when [`crate::dry_run::is_dry_run`] is true
 //! (debug builds by default; see that module), same as every other command
 //! in this module.
@@ -59,27 +66,40 @@ impl Command for UpdateSystem {
         "UpdateSystem"
     }
 
-    /// Runs [`modulix_core_utils::update::update`] with the `BuildCommand`
-    /// and core cap that `arguments[0]` selects.
+    /// Applies the candidate `flake.lock` left by the last
+    /// `Store1.CheckUpdate` through
+    /// [`modulix_core_utils::update::update_with_lock`], with the
+    /// `BuildCommand` and core cap that `arguments[0]` selects.
+    ///
+    /// The lockfile comes from [`crate::store::take_pending_lock`], so the
+    /// system lands on exactly the revisions the check announced. When no
+    /// check ran - or a previous update already consumed its result - the
+    /// probe runs here instead, so a caller never has to sequence the two
+    /// calls itself.
     ///
     /// # Parameters
     /// * `arguments` - exactly one element, `"switch"` or `"boot"`.
     ///
     /// # Post-conditions
-    /// Skipped entirely - only logged - when [`crate::dry_run::is_dry_run`]
-    /// is true. Otherwise blocks for the whole `nix flake update` plus,
-    /// if any input actually moved, the whole rebuild (potentially
-    /// minutes). `"switch"` uses every core; `"boot"` is capped to
-    /// [`half_cores`] of [`available_cores`] - see the module docs for why.
+    /// The library call is skipped entirely - only logged - when
+    /// [`crate::dry_run::is_dry_run`] is true. A system already up to date
+    /// writes nothing and runs no rebuild. Otherwise blocks for the whole
+    /// rebuild (potentially minutes), preceded by the refresh probe when no
+    /// candidate was pending. `"switch"` uses every core; `"boot"` is capped
+    /// to [`half_cores`] of [`available_cores`] - see the module docs for why.
+    /// The candidate is consumed either way: a failed rebuild does not put it
+    /// back, the next check recomputes it.
     ///
     /// # Returns
     /// `"system updated (switch)"` for `"switch"`, `"system update prepared
-    /// for next boot"` for `"boot"`.
+    /// for next boot"` for `"boot"`, or `"system already up to date"` when
+    /// there was nothing to apply.
     ///
     /// # Errors
     /// [`Error::CoreUtils`] if `arguments[0]` is missing or neither
-    /// `"switch"` nor `"boot"`, if the `spawn_blocking` task panics/is
-    /// cancelled, or if [`modulix_core_utils::update::update`] itself fails.
+    /// `"switch"` nor `"boot"`, if the refresh probe fails, if the
+    /// `spawn_blocking` task panics/is cancelled, or if
+    /// [`modulix_core_utils::update::update_with_lock`] itself fails.
     async fn execute(&self, arguments: &[&str]) -> Result<String, Error> {
         let mode = arguments
             .first()
@@ -96,12 +116,25 @@ impl Command for UpdateSystem {
             }
         };
 
+        let lock = match crate::store::take_pending_lock() {
+            Some(lock) => Some(lock),
+            None => modulix_core_utils::update::check_update(crate::config_dir::config_dir())
+                .await
+                .map_err(|e| Error::CoreUtils(e.to_string()))?,
+        };
+
+        let Some(lock) = lock else {
+            tracing::info!(mode, "system already up to date");
+            return Ok("system already up to date".to_string());
+        };
+
         tracing::info!(mode, ?cores, "updating system");
 
         if !crate::dry_run::is_dry_run() {
             tokio::task::spawn_blocking(move || {
-                modulix_core_utils::update::update(
+                modulix_core_utils::update::update_with_lock(
                     crate::config_dir::config_dir(),
+                    lock,
                     build_command,
                     cores,
                 )

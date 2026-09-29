@@ -113,7 +113,10 @@ impl Daemon {
     ///
     /// On success of `"UpdateSystem"` specifically: `crate::store`'s outdated-
     /// inputs cache is invalidated via `crate::store::invalidate_updates` (a
-    /// completed update should not keep reporting itself as outdated), and
+    /// completed update should not keep reporting itself as outdated), the
+    /// candidate lockfile slot is emptied via
+    /// `crate::store::clear_pending_lock` (the command already took it; this
+    /// also covers a check that landed while the update was running), and
     /// the package index's nixpkgs fingerprint is invalidated with a
     /// background refresh spawned (not awaited — same non-blocking shape as
     /// `spawn_rebuild_signal_handler`'s SIGHUP handler in `src/main.rs`,
@@ -152,6 +155,7 @@ impl Daemon {
                 crate::store::invalidate_installed();
             } else if name == "UpdateSystem" {
                 crate::store::invalidate_updates();
+                crate::store::clear_pending_lock();
                 modulix_core_utils::package_index::invalidate_fingerprint();
                 tokio::spawn(modulix_core_utils::package_index::ensure_fresh_in_background());
             }
@@ -471,15 +475,18 @@ impl Daemon {
     ///
     /// # Returns
     /// `"system updated (switch)"` or `"system update prepared for next
-    /// boot"`, once the rebuild has completed.
+    /// boot"`, once the rebuild has completed, or `"system already up to
+    /// date"` when there was nothing to apply.
     ///
     /// # Post-conditions
-    /// The call blocks for the whole `nix flake update` plus, if any input
-    /// actually moved, the whole `nixos-rebuild` — potentially **minutes**.
-    /// Unless [`crate::dry_run::is_dry_run`] is true (the default in debug
-    /// builds), a successful call also invalidates the outdated-inputs
-    /// cache and kicks off a background package-index refresh (see
-    /// `Daemon::run`).
+    /// The candidate `flake.lock` left by the last `Store1.CheckUpdate` is
+    /// consumed and written as-is, so the revisions installed are the ones
+    /// that check announced; with no candidate pending, the refresh is
+    /// resolved here first. The call blocks for the whole `nixos-rebuild` —
+    /// potentially **minutes** — plus that probe when it runs. Unless
+    /// [`crate::dry_run::is_dry_run`] is true (the default in debug builds), a
+    /// successful call also invalidates the outdated-inputs cache and kicks
+    /// off a background package-index refresh (see `Daemon::run`).
     ///
     /// # Errors
     /// A D-Bus error reply is returned, and no rebuild is attempted, if the

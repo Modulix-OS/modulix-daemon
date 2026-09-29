@@ -132,6 +132,22 @@ static INSTALLED_CACHE: OnceLock<FlightCache<(), Arc<InstalledSets>>> = OnceLock
 /// key (`()` — there is only ever one `flake.lock` to describe) — see
 /// [`update_cache`].
 static UPDATE_CACHE: OnceLock<FlightCache<(), Arc<Vec<InputEntry>>>> = OnceLock::new();
+
+/// Candidate `flake.lock` produced by the last [`Store::check_update`], kept
+/// in RAM until the next `UpdateSystem` writes it.
+///
+/// Deliberately **not** a [`FlightCache`]: there is no TTL to honour and the
+/// value is taken, not read — it is overwritten by the next check and emptied
+/// by [`take_pending_lock`]. Holding it means the revisions `UpdateSystem`
+/// applies are exactly the ones the check announced, at the cost of one
+/// lockfile's worth of memory.
+static PENDING_LOCK: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Serialises [`Store::check_update`]: the probe is an unprivileged,
+/// minutes-long `nix flake update`, so concurrent callers must queue behind
+/// one rather than each spawning their own.
+static CHECK_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Key = module name, value = the **bare** plugin names (last component of
 /// each `pkgs.<namespace>.<plugin>` token) currently listed under
 /// `mx.<module>.plugins`. Matching by bare name rather than the full token
@@ -464,6 +480,39 @@ pub fn invalidate_installed() {
 /// just an expired one.
 pub fn invalidate_updates() {
     update_cache().clear();
+}
+
+/// Hands over the candidate `flake.lock` computed by the last
+/// [`Store::check_update`], emptying the slot.
+///
+/// Called by [`crate::command::update`] at the top of `UpdateSystem`: the
+/// caller owns the lockfile from then on and applies it through
+/// `modulix_core_utils::update::update_with_lock`.
+///
+/// # Returns
+/// `Some(lockfile)` when a check found an update and nothing consumed it yet,
+/// `None` when no check ran, the last one found the system current, or a
+/// previous `UpdateSystem` already took it.
+///
+/// # Post-conditions
+/// [`PENDING_LOCK`] is empty afterwards, whatever it held. A failed update
+/// therefore does **not** put the lockfile back: the next check recomputes it,
+/// which is the safe direction — a rebuild that failed halfway may have moved
+/// the configuration.
+pub fn take_pending_lock() -> Option<String> {
+    PENDING_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+/// Drops the candidate `flake.lock`, if any.
+///
+/// # Post-conditions
+/// [`PENDING_LOCK`] is empty; the next `UpdateSystem` re-runs its own check
+/// rather than applying a lockfile whose premises may have changed.
+pub fn clear_pending_lock() {
+    *PENDING_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Resolve every module concurrently (bounded) instead of one at a time —
@@ -1056,6 +1105,99 @@ impl Store {
             .await;
         Ok(entries.iter().cloned().map(InputEntry::into_dict).collect())
     }
+
+    /// Serves `CheckUpdate() -> b`: whether refreshing every flake input would
+    /// change anything, and — as a side effect — the preparation of that
+    /// refresh.
+    ///
+    /// Unlike [`list_outdated_inputs`](Store::list_outdated_inputs), which
+    /// probes each input's upstream metadata separately, this lets `nix` lock
+    /// the whole flake into a scratch file
+    /// ([`modulix_core_utils::update::check_update`]) and keeps the resulting
+    /// lockfile in [`PENDING_LOCK`]. The next `UpdateSystem` writes that very
+    /// lockfile instead of re-resolving, so the revisions installed are the
+    /// ones this call announced and the network cost is paid once.
+    ///
+    /// [`UPDATE_CACHE`] is refilled from a **local** diff of the two lockfiles
+    /// ([`modulix_core_utils::update::diff_locks`]), so a `ListOutdatedInputs`
+    /// right after is both free and consistent with what will be applied.
+    ///
+    /// Concurrent callers queue behind [`CHECK_GUARD`] rather than each
+    /// spawning a refresh; the second one then re-runs the probe, which is
+    /// what "check again" is supposed to mean.
+    ///
+    /// # Returns
+    /// `true` when the candidate lockfile differs from the current one,
+    /// `false` when the system is already current — or when the probe failed,
+    /// which is logged at `warn` and reported as "nothing to update" rather
+    /// than as an error.
+    ///
+    /// # Post-conditions
+    /// The configuration directory is untouched: no lockfile is written, no
+    /// rebuild runs, no privilege is required. On `true`, [`PENDING_LOCK`]
+    /// holds the candidate until an `UpdateSystem` takes it (see
+    /// [`take_pending_lock`]) or the next check overwrites it; on `false` it is
+    /// emptied. Blocks for the whole refresh, which refetches every input and
+    /// can take **minutes**, not milliseconds.
+    ///
+    /// # Errors
+    /// Never returns `Err`.
+    async fn check_update(&self) -> zbus::fdo::Result<bool> {
+        let _guard = CHECK_GUARD.lock().await;
+
+        let config_dir = crate::config_dir::config_dir();
+        let candidate = match modulix_core_utils::update::check_update(config_dir).await {
+            Ok(candidate) => candidate,
+            Err(e) => {
+                tracing::warn!(error = %e, "check_update");
+                return Ok(false);
+            }
+        };
+
+        let entries = match candidate.as_deref() {
+            Some(lock) => lock_diff_entries(config_dir, lock).await,
+            None => Vec::new(),
+        };
+        update_cache().insert((), Arc::new(entries));
+
+        let found = candidate.is_some();
+        *PENDING_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = candidate;
+        Ok(found)
+    }
+}
+
+/// Diffs the configuration's current `flake.lock` against a candidate one,
+/// as the rows `ListOutdatedInputs` serves.
+///
+/// # Parameters
+/// * `config_dir` - configuration repository whose `flake.lock` is the "old"
+///   side of the diff.
+/// * `candidate` - the new lockfile text, as returned by
+///   [`modulix_core_utils::update::check_update`].
+///
+/// # Returns
+/// One [`InputEntry`] per direct input whose revision moved. Empty when only
+/// transitive nodes moved, and empty on failure — an unreadable or unparsable
+/// lockfile is logged at `warn` and degrades the *detail* listing only, never
+/// the boolean [`Store::check_update`] reports.
+async fn lock_diff_entries(config_dir: &str, candidate: &str) -> Vec<InputEntry> {
+    let lock_path = std::path::Path::new(config_dir).join("flake.lock");
+    let current = match tokio::fs::read_to_string(&lock_path).await {
+        Ok(current) => current,
+        Err(e) => {
+            tracing::warn!(error = %e, "check_update: reading flake.lock");
+            return Vec::new();
+        }
+    };
+
+    modulix_core_utils::update::diff_locks(&current, candidate)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "check_update: diffing lockfiles");
+            Vec::new()
+        })
+        .into_iter()
+        .map(InputEntry::from)
+        .collect()
 }
 
 /// Fetches Flathub enrichment for one app-id. No caching — [`Store::get_app_enrichment`]

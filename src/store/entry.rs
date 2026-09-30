@@ -823,9 +823,79 @@ pub fn alt_sort_key(e: &AppEntry) -> (u8, i32, &str) {
     )
 }
 
+/// The Modulix OS release `mxpkgs` publishes, as sent over
+/// `org.modulix.Store1`.
+///
+/// Mirrors `modulix_core_utils::release::Release`: the same two fields the
+/// distribution's `flake.nix` reads for `mx.branding`. Serialized into one
+/// `a{sv}` dict by [`Self::into_dict`]; read back client-side to decide
+/// whether to show the distro-upgrade banner
+/// (`gnome-software-plugin/plugin/src/gs-modulix-upgrade.c`), which compares
+/// `version` with the running system's `VERSION_ID`.
+#[derive(Clone)]
+pub struct ReleaseEntry {
+    /// Release number, the string a built system exposes as `VERSION_ID`.
+    /// Bus key `"version"`, zvariant `s`. Always present.
+    pub version: String,
+    /// Human-readable release name, `VERSION_CODENAME`'s source. Bus key
+    /// `"code_name"`, zvariant `s`. Always present.
+    pub code_name: String,
+}
+
+impl ReleaseEntry {
+    /// Serializes `self` into the `a{sv}` [`Dict`] sent over
+    /// `org.modulix.Store1` for the remote-release read.
+    ///
+    /// # Parameters
+    /// None beyond `self`, consumed by value.
+    ///
+    /// # Returns
+    /// A [`Dict`] with `"version"` and `"code_name"` always present. An empty
+    /// dict is what the interface sends instead when no release could be read,
+    /// so a client must treat a missing key as "unknown", never as an error.
+    pub fn into_dict(self) -> Dict {
+        let mut d = Dict::new();
+        d.insert("version".into(), ov(self.version));
+        d.insert("code_name".into(), ov(self.code_name));
+        d
+    }
+}
+
+impl From<modulix_core_utils::release::Release> for ReleaseEntry {
+    /// Converts the library's plain struct into the bus-serializable entry.
+    ///
+    /// # Returns
+    /// A [`ReleaseEntry`] with each field copied verbatim from `value`.
+    fn from(value: modulix_core_utils::release::Release) -> Self {
+        ReleaseEntry {
+            version: value.version,
+            code_name: value.code_name,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_entry_carries_both_fields() {
+        let dict = ReleaseEntry {
+            version: "0.2".to_string(),
+            code_name: "Clarté".to_string(),
+        }
+        .into_dict();
+
+        assert_eq!(dict.len(), 2);
+        assert_eq!(
+            String::try_from(dict["version"].clone()).unwrap(),
+            "0.2".to_string()
+        );
+        assert_eq!(
+            String::try_from(dict["code_name"].clone()).unwrap(),
+            "Clarté".to_string()
+        );
+    }
 
     /// Builds a minimal test [`AppEntry`] with fixed `summary`/`version`
     /// and `kind: "package"`.

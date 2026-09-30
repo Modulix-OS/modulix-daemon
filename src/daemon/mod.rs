@@ -111,17 +111,26 @@ impl Daemon {
     /// every command reachable through this path, since all of them are
     /// named `Install*`/`Uninstall*`.
     ///
-    /// On success of `"UpdateSystem"` specifically: `crate::store`'s outdated-
-    /// inputs cache is invalidated via `crate::store::invalidate_updates` (a
-    /// completed update should not keep reporting itself as outdated), the
-    /// candidate lockfile slot is emptied via
-    /// `crate::store::clear_pending_lock` (the command already took it; this
-    /// also covers a check that landed while the update was running), and
+    /// On success of `"UpdateSystem"` specifically, and only when its mode
+    /// actually applied something (`"switch"` or `"boot"` — **not** `"build"`,
+    /// see below): `crate::store`'s outdated-inputs cache is invalidated via
+    /// `crate::store::invalidate_updates` (a completed update should not keep
+    /// reporting itself as outdated), the cached upstream release is dropped via
+    /// `crate::store::invalidate_release` (the update carries the `release.json`
+    /// the distro-upgrade banner was announcing), the candidate lockfile slot is
+    /// emptied via `crate::store::clear_pending_lock` (the command already took it;
+    /// this also covers a check that landed while the update was running), and
     /// the package index's nixpkgs fingerprint is invalidated with a
     /// background refresh spawned (not awaited — same non-blocking shape as
     /// `spawn_rebuild_signal_handler`'s SIGHUP handler in `src/main.rs`,
     /// which this reuses) since a successful update moves nixpkgs out from
     /// under the index.
+    ///
+    /// `UpdateSystem("build")` is exempt from all three: it only warms the nix
+    /// store, so the system is still outdated afterwards (the row must keep
+    /// showing), the candidate must stay pending for the `"switch"`/`"boot"`
+    /// that follows to apply the revisions just built, and nixpkgs has not
+    /// moved under the index.
     ///
     /// # Errors
     /// Returns an error, and skips both execution and cache invalidation,
@@ -153,8 +162,9 @@ impl Daemon {
         if result.is_ok() {
             if name.starts_with("Install") || name.starts_with("Uninstall") {
                 crate::store::invalidate_installed();
-            } else if name == "UpdateSystem" {
+            } else if name == "UpdateSystem" && arguments.first() != Some(&"build") {
                 crate::store::invalidate_updates();
+                crate::store::invalidate_release();
                 crate::store::clear_pending_lock();
                 modulix_core_utils::package_index::invalidate_fingerprint();
                 tokio::spawn(modulix_core_utils::package_index::ensure_fresh_in_background());
@@ -462,10 +472,11 @@ impl Daemon {
     ///
     /// # Parameters
     /// * `mode` - `"switch"` to rebuild and switch immediately (a
-    ///   user-triggered "Update Now"), or `"boot"` to only prepare the next
-    ///   boot (GNOME Software preparing an update in the background). See
-    ///   `crate::command::update` for how `mode` also decides the CPU-core
-    ///   cap on the rebuild.
+    ///   user-triggered "Update Now"), `"boot"` to only prepare the next boot
+    ///   (GNOME Software applying an update by itself), or `"build"` to realise
+    ///   the new closure without activating anything (GNOME Software's
+    ///   "download" step). See `crate::command::update` for how `mode` also
+    ///   decides the CPU-core cap on the rebuild.
     ///
     /// # Pre-conditions
     /// The caller must be authorized for the [`ACTION_UPDATE`] polkit
@@ -474,26 +485,29 @@ impl Daemon {
     /// background-prepared update can complete unattended.
     ///
     /// # Returns
-    /// `"system updated (switch)"` or `"system update prepared for next
-    /// boot"`, once the rebuild has completed, or `"system already up to
-    /// date"` when there was nothing to apply.
+    /// `"system updated (switch)"`, `"system update prepared for next boot"` or
+    /// `"system update downloaded"`, once the build has completed, or
+    /// `"system already up to date"` when there was nothing to apply.
     ///
     /// # Post-conditions
     /// The candidate `flake.lock` left by the last `Store1.CheckUpdate` is
-    /// consumed and written as-is, so the revisions installed are the ones
-    /// that check announced; with no candidate pending, the refresh is
-    /// resolved here first. The call blocks for the whole `nixos-rebuild` —
-    /// potentially **minutes** — plus that probe when it runs. Unless
-    /// [`crate::dry_run::is_dry_run`] is true (the default in debug builds), a
-    /// successful call also invalidates the outdated-inputs cache and kicks
-    /// off a background package-index refresh (see `Daemon::run`).
+    /// written as-is, so the revisions installed are the ones that check
+    /// announced; with no candidate pending, the refresh is resolved here
+    /// first. `"switch"` and `"boot"` consume the candidate; `"build"` leaves
+    /// it pending, writes nothing into the configuration repository and does
+    /// not touch the running system — it only warms the nix store. The call
+    /// blocks for the whole build — potentially **minutes** — plus that probe
+    /// when it runs. Unless [`crate::dry_run::is_dry_run`] is true (the default
+    /// in debug builds), a successful `"switch"`/`"boot"` also invalidates the
+    /// outdated-inputs cache and kicks off a background package-index refresh
+    /// (see `Daemon::run`); `"build"` invalidates nothing.
     ///
     /// # Errors
-    /// A D-Bus error reply is returned, and no rebuild is attempted, if the
+    /// A D-Bus error reply is returned, and no build is attempted, if the
     /// caller declines or is otherwise denied polkit authorization, or if
-    /// `mode` is neither `"switch"` nor `"boot"`. A D-Bus error reply is
-    /// also returned if the underlying `modulix-core-utils` call fails, in
-    /// which case the configuration is left unchanged.
+    /// `mode` is none of `"switch"`, `"boot"` and `"build"`. A D-Bus error
+    /// reply is also returned if the underlying `modulix-core-utils` call
+    /// fails, in which case the configuration is left unchanged.
     async fn update_system(
         &self,
         mode: &str,

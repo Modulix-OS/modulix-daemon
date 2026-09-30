@@ -22,7 +22,7 @@ use modulix_core_utils::{
 
 use crate::cache::FlightCache;
 use entry::{
-    AppEntry, Dict, EnrichEntry, InputEntry, PluginEntry, alt_sort_key, base_attr,
+    AppEntry, Dict, EnrichEntry, InputEntry, PluginEntry, ReleaseEntry, alt_sort_key, base_attr,
     collect_screenshots, dedup_by_group, icon_base_name, icon_name_for_app_id, module_entry,
     module_rows_for_app_id, package_entry, variant_label, variant_rank,
 };
@@ -76,6 +76,14 @@ const INSTALLED_CACHE_TTL: Duration = Duration::from_secs(5);
 /// `Store::list_outdated_inputs`). A completed `UpdateSystem` call also
 /// clears this early via [`invalidate_updates`].
 const UPDATE_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// TTL of [`RELEASE_CACHE`]: how long the release `mxpkgs` publishes is served
+/// from cache before [`Store::get_remote_release`] refetches it. Twelve hours,
+/// because a release number moves a few times a year at most while GNOME
+/// Software asks for it on every visit to the Updates page. A completed
+/// `UpdateSystem` also clears it early via [`invalidate_release`], so the
+/// banner cannot outlive the upgrade it announced.
+const RELEASE_CACHE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Ceiling on `nix eval` invocations a single `GetPackageLicenses` call may
 /// trigger. GNOME Software asks for a license on the details page (one app),
@@ -132,15 +140,22 @@ static INSTALLED_CACHE: OnceLock<FlightCache<(), Arc<InstalledSets>>> = OnceLock
 /// key (`()` — there is only ever one `flake.lock` to describe) — see
 /// [`update_cache`].
 static UPDATE_CACHE: OnceLock<FlightCache<(), Arc<Vec<InputEntry>>>> = OnceLock::new();
+/// Single-flight, TTL'd cache of the release `mxpkgs` publishes, with a single
+/// key (`()` — there is only ever one upstream release to describe) — see
+/// [`release_cache`]. The value is `None` when the last fetch failed or served
+/// an implausible `release.json`, which is cached too: a broken endpoint must
+/// not be retried on every page visit.
+static RELEASE_CACHE: OnceLock<FlightCache<(), Arc<Option<ReleaseEntry>>>> = OnceLock::new();
 
 /// Candidate `flake.lock` produced by the last [`Store::check_update`], kept
 /// in RAM until the next `UpdateSystem` writes it.
 ///
 /// Deliberately **not** a [`FlightCache`]: there is no TTL to honour and the
-/// value is taken, not read — it is overwritten by the next check and emptied
-/// by [`take_pending_lock`]. Holding it means the revisions `UpdateSystem`
-/// applies are exactly the ones the check announced, at the cost of one
-/// lockfile's worth of memory.
+/// value is normally taken, not read — it is overwritten by the next check and
+/// emptied by [`take_pending_lock`] (only `"build"` mode reads it without
+/// consuming it, through [`peek_pending_lock`]). Holding it means the revisions
+/// `UpdateSystem` applies are exactly the ones the check announced, at the cost
+/// of one lockfile's worth of memory.
 static PENDING_LOCK: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Serialises [`Store::check_update`]: the probe is an unprivileged,
@@ -289,6 +304,17 @@ fn installed_cache() -> &'static FlightCache<(), Arc<InstalledSets>> {
 /// of the daemon.
 fn update_cache() -> &'static FlightCache<(), Arc<Vec<InputEntry>>> {
     UPDATE_CACHE.get_or_init(|| FlightCache::new(UPDATE_CACHE_TTL, 1))
+}
+
+/// The process-wide [`RELEASE_CACHE`], created with [`RELEASE_CACHE_TTL`] on
+/// first access. Uses a cap of 1, same single-key rationale as
+/// [`installed_cache`].
+///
+/// # Returns
+/// A `'static` reference to the cache, shared by every caller for the life
+/// of the daemon.
+fn release_cache() -> &'static FlightCache<(), Arc<Option<ReleaseEntry>>> {
+    RELEASE_CACHE.get_or_init(|| FlightCache::new(RELEASE_CACHE_TTL, 1))
 }
 
 /// The cached installed sets. Behind an `Arc`: one search stamps hundreds of
@@ -482,6 +508,21 @@ pub fn invalidate_updates() {
     update_cache().clear();
 }
 
+/// Drops the cached upstream release, so the next `GetRemoteRelease` refetches
+/// `release.json`.
+///
+/// Called by [`crate::daemon`] after a successful `UpdateSystem`, for the same
+/// reason as [`invalidate_updates`]: an applied update moves the system onto the
+/// revision that carries the new `release.json`, so a banner announcing that
+/// very release must not survive it for up to [`RELEASE_CACHE_TTL`].
+///
+/// # Post-conditions
+/// [`RELEASE_CACHE`] is cleared unconditionally — a fresh entry included, not
+/// just an expired one.
+pub fn invalidate_release() {
+    release_cache().clear();
+}
+
 /// Hands over the candidate `flake.lock` computed by the last
 /// [`Store::check_update`], emptying the slot.
 ///
@@ -504,6 +545,26 @@ pub fn take_pending_lock() -> Option<String> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
+}
+
+/// Hands over a copy of the candidate `flake.lock`, leaving the slot filled.
+///
+/// The read-only counterpart of [`take_pending_lock`], for `UpdateSystem`'s
+/// `"build"` mode: pre-building the candidate must not consume it, or the
+/// `"switch"`/`"boot"` that follows would resolve a fresh lockfile and could
+/// install different revisions than the ones just built.
+///
+/// # Returns
+/// `Some(lockfile)` when a check found an update and nothing consumed it yet,
+/// `None` in the same cases as [`take_pending_lock`].
+///
+/// # Post-conditions
+/// [`PENDING_LOCK`] is left exactly as it was.
+pub fn peek_pending_lock() -> Option<String> {
+    PENDING_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// Drops the candidate `flake.lock`, if any.
@@ -1106,6 +1167,47 @@ impl Store {
         Ok(entries.iter().cloned().map(InputEntry::into_dict).collect())
     }
 
+    /// Serves `GetRemoteRelease() -> a{sv}`: the Modulix OS release `mxpkgs`
+    /// currently publishes.
+    ///
+    /// Purely descriptive. It says what release exists upstream, never whether
+    /// this system should move to it: the comparison against the running
+    /// `VERSION_ID` is the client's
+    /// (`gnome-software-plugin/plugin/src/gs-modulix-upgrade.c`), which is also
+    /// the only place that knows the system's own version.
+    ///
+    /// Answers from [`RELEASE_CACHE`] for [`RELEASE_CACHE_TTL`]; a failed or
+    /// implausible fetch is cached as "unknown" too, so a broken endpoint costs
+    /// one request per TTL rather than one per page visit.
+    ///
+    /// # Returns
+    /// A dict with `"version"` and `"code_name"`, or an **empty** dict when no
+    /// release could be read. Never an error: `gs_plugin_job_list_distro_upgrades`
+    /// fails the whole job — every plugin's contribution included — as soon as
+    /// one plugin errors, so "unknown" has to travel as data.
+    ///
+    /// # Errors
+    /// Never returns `Err`.
+    async fn get_remote_release(&self) -> zbus::fdo::Result<Dict> {
+        let entry = release_cache()
+            .get_or_fetch((), || async {
+                Arc::new(
+                    modulix_core_utils::release::remote_release()
+                        .await
+                        .map(ReleaseEntry::from)
+                        .map_err(|e| tracing::warn!(error = %e, "get_remote_release"))
+                        .ok(),
+                )
+            })
+            .await;
+
+        Ok(entry
+            .as_ref()
+            .clone()
+            .map(ReleaseEntry::into_dict)
+            .unwrap_or_default())
+    }
+
     /// Serves `CheckUpdate() -> b`: whether refreshing every flake input would
     /// change anything, and — as a side effect — the preparation of that
     /// refresh.
@@ -1311,6 +1413,19 @@ async fn build_alt_entries(gid: String, table_attrs: &'static [&'static str]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peek_pending_lock_does_not_consume_the_candidate() {
+        *PENDING_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = Some("candidate".to_string());
+
+        assert_eq!(peek_pending_lock().as_deref(), Some("candidate"));
+        // The whole point of `peek`: `UpdateSystem("build")` reads the lockfile
+        // it is about to realise, and the `switch`/`boot` that follows must
+        // still find it.
+        assert_eq!(peek_pending_lock().as_deref(), Some("candidate"));
+        assert_eq!(take_pending_lock().as_deref(), Some("candidate"));
+        assert_eq!(peek_pending_lock(), None);
+    }
 
     #[tokio::test]
     async fn packages_for_app_id_serializes() {

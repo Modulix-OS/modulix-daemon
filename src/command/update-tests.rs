@@ -40,3 +40,9 @@ async fn update_system_unknown_mode_errors() {
     let result = UpdateSystem.execute(&["frobnicate"]).await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn update_system_build_reports_success() {
+    let result = UpdateSystem.execute(&["build"]).await.unwrap();
+    assert_eq!(result, "system update downloaded");
+}

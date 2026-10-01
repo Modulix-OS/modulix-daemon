@@ -22,7 +22,7 @@ use modulix_core_utils::{
 
 use crate::cache::FlightCache;
 use entry::{
-    AppEntry, Dict, EnrichEntry, InputEntry, PluginEntry, ReleaseEntry, alt_sort_key, base_attr,
+    AppEntry, Dict, EnrichEntry, InputEntry, PluginEntry, alt_sort_key, base_attr,
     collect_screenshots, dedup_by_group, icon_base_name, icon_name_for_app_id, module_entry,
     module_rows_for_app_id, package_entry, variant_label, variant_rank,
 };
@@ -77,13 +77,6 @@ const INSTALLED_CACHE_TTL: Duration = Duration::from_secs(5);
 /// clears this early via [`invalidate_updates`].
 const UPDATE_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
-/// TTL of [`RELEASE_CACHE`]: how long the release `mxpkgs` publishes is served
-/// from cache before [`Store::get_remote_release`] refetches it. Twelve hours,
-/// because a release number moves a few times a year at most while GNOME
-/// Software asks for it on every visit to the Updates page. A completed
-/// `UpdateSystem` also clears it early via [`invalidate_release`], so the
-/// banner cannot outlive the upgrade it announced.
-const RELEASE_CACHE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Ceiling on `nix eval` invocations a single `GetPackageLicenses` call may
 /// trigger. GNOME Software asks for a license on the details page (one app),
@@ -140,12 +133,6 @@ static INSTALLED_CACHE: OnceLock<FlightCache<(), Arc<InstalledSets>>> = OnceLock
 /// key (`()` — there is only ever one `flake.lock` to describe) — see
 /// [`update_cache`].
 static UPDATE_CACHE: OnceLock<FlightCache<(), Arc<Vec<InputEntry>>>> = OnceLock::new();
-/// Single-flight, TTL'd cache of the release `mxpkgs` publishes, with a single
-/// key (`()` — there is only ever one upstream release to describe) — see
-/// [`release_cache`]. The value is `None` when the last fetch failed or served
-/// an implausible `release.json`, which is cached too: a broken endpoint must
-/// not be retried on every page visit.
-static RELEASE_CACHE: OnceLock<FlightCache<(), Arc<Option<ReleaseEntry>>>> = OnceLock::new();
 
 /// Candidate `flake.lock` produced by the last [`Store::check_update`], kept
 /// in RAM until the next `UpdateSystem` writes it.
@@ -306,16 +293,6 @@ fn update_cache() -> &'static FlightCache<(), Arc<Vec<InputEntry>>> {
     UPDATE_CACHE.get_or_init(|| FlightCache::new(UPDATE_CACHE_TTL, 1))
 }
 
-/// The process-wide [`RELEASE_CACHE`], created with [`RELEASE_CACHE_TTL`] on
-/// first access. Uses a cap of 1, same single-key rationale as
-/// [`installed_cache`].
-///
-/// # Returns
-/// A `'static` reference to the cache, shared by every caller for the life
-/// of the daemon.
-fn release_cache() -> &'static FlightCache<(), Arc<Option<ReleaseEntry>>> {
-    RELEASE_CACHE.get_or_init(|| FlightCache::new(RELEASE_CACHE_TTL, 1))
-}
 
 /// The cached installed sets. Behind an `Arc`: one search stamps hundreds of
 /// entries against the same snapshot, and cloning the sets each time would
@@ -506,21 +483,6 @@ pub fn invalidate_installed() {
 /// just an expired one.
 pub fn invalidate_updates() {
     update_cache().clear();
-}
-
-/// Drops the cached upstream release, so the next `GetRemoteRelease` refetches
-/// `release.json`.
-///
-/// Called by [`crate::daemon`] after a successful `UpdateSystem`, for the same
-/// reason as [`invalidate_updates`]: an applied update moves the system onto the
-/// revision that carries the new `release.json`, so a banner announcing that
-/// very release must not survive it for up to [`RELEASE_CACHE_TTL`].
-///
-/// # Post-conditions
-/// [`RELEASE_CACHE`] is cleared unconditionally — a fresh entry included, not
-/// just an expired one.
-pub fn invalidate_release() {
-    release_cache().clear();
 }
 
 /// Hands over the candidate `flake.lock` computed by the last
@@ -1165,47 +1127,6 @@ impl Store {
             })
             .await;
         Ok(entries.iter().cloned().map(InputEntry::into_dict).collect())
-    }
-
-    /// Serves `GetRemoteRelease() -> a{sv}`: the Modulix OS release `mxpkgs`
-    /// currently publishes.
-    ///
-    /// Purely descriptive. It says what release exists upstream, never whether
-    /// this system should move to it: the comparison against the running
-    /// `VERSION_ID` is the client's
-    /// (`gnome-software-plugin/plugin/src/gs-modulix-upgrade.c`), which is also
-    /// the only place that knows the system's own version.
-    ///
-    /// Answers from [`RELEASE_CACHE`] for [`RELEASE_CACHE_TTL`]; a failed or
-    /// implausible fetch is cached as "unknown" too, so a broken endpoint costs
-    /// one request per TTL rather than one per page visit.
-    ///
-    /// # Returns
-    /// A dict with `"version"` and `"code_name"`, or an **empty** dict when no
-    /// release could be read. Never an error: `gs_plugin_job_list_distro_upgrades`
-    /// fails the whole job — every plugin's contribution included — as soon as
-    /// one plugin errors, so "unknown" has to travel as data.
-    ///
-    /// # Errors
-    /// Never returns `Err`.
-    async fn get_remote_release(&self) -> zbus::fdo::Result<Dict> {
-        let entry = release_cache()
-            .get_or_fetch((), || async {
-                Arc::new(
-                    modulix_core_utils::release::remote_release()
-                        .await
-                        .map(ReleaseEntry::from)
-                        .map_err(|e| tracing::warn!(error = %e, "get_remote_release"))
-                        .ok(),
-                )
-            })
-            .await;
-
-        Ok(entry
-            .as_ref()
-            .clone()
-            .map(ReleaseEntry::into_dict)
-            .unwrap_or_default())
     }
 
     /// Serves `CheckUpdate() -> b`: whether refreshing every flake input would

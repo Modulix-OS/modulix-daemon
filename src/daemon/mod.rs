@@ -115,9 +115,7 @@ impl Daemon {
     /// actually applied something (`"switch"` or `"boot"` — **not** `"build"`,
     /// see below): `crate::store`'s outdated-inputs cache is invalidated via
     /// `crate::store::invalidate_updates` (a completed update should not keep
-    /// reporting itself as outdated), the cached upstream release is dropped via
-    /// `crate::store::invalidate_release` (the update carries the `release.json`
-    /// the distro-upgrade banner was announcing), the candidate lockfile slot is
+    /// reporting itself as outdated), the candidate lockfile slot is
     /// emptied via `crate::store::clear_pending_lock` (the command already took it;
     /// this also covers a check that landed while the update was running), and
     /// the package index's nixpkgs fingerprint is invalidated with a
@@ -164,7 +162,6 @@ impl Daemon {
                 crate::store::invalidate_installed();
             } else if name == "UpdateSystem" && arguments.first() != Some(&"build") {
                 crate::store::invalidate_updates();
-                crate::store::invalidate_release();
                 crate::store::clear_pending_lock();
                 modulix_core_utils::package_index::invalidate_fingerprint();
                 tokio::spawn(modulix_core_utils::package_index::ensure_fresh_in_background());

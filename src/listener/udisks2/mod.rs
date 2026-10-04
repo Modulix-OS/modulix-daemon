@@ -1,15 +1,45 @@
-//! Listener for `org.freedesktop.UDisks2`.
+//! Listeners for `org.freedesktop.UDisks2`.
 //!
-//! Detects changes to a partition's `fstab` mount configuration
-//! (`org.freedesktop.UDisks2.Block.Configuration`) and reports them to the
-//! external library: a new `fstab` entry is a mount, a removed entry is an
+//! Two complementary paths detect changes to a partition's `fstab` mount
+//! configuration and report them to the external library:
+//!
+//! * [`monitor`] ([`Udisks2MonitorListener`]) intercepts the
+//!   `AddConfigurationItem`/`RemoveConfigurationItem`/`UpdateConfigurationItem`
+//!   method calls on `org.freedesktop.UDisks2.Block`. **This is the primary
+//!   path**: it sees the request itself, so it is unaffected by whether UDisks2
+//!   then manages to persist it, it is not subject to the property stream's
+//!   coalescing, and — decisively — it cannot be triggered by our own
+//!   `nixos-rebuild` (see the feedback loop below).
+//! * This module ([`Udisks2Listener`]) watches the resulting
+//!   `org.freedesktop.UDisks2.Block.Configuration` property, which covers what
+//!   the monitor cannot see: a `/etc/fstab` change made outside D-Bus, and the
+//!   state of a device at the moment it appears.
+//!
+//! Both paths observe the same user action whenever UDisks2 does write
+//! `/etc/fstab`, which as root it does: it writes a temporary file and renames
+//! it over the path, replacing the NixOS store symlink with a regular file.
+//! [`recent`] is what keeps such an action reported once: the monitor stamps
+//! the device before reporting, and this module skips reporting a change it
+//! recognises as that stamp's echo (its baseline is still updated).
+//!
+//! # Feedback loop on `/etc/fstab`
+//! Reporting a change eventually rewrites `fstab.nix` and runs
+//! `nixos-rebuild switch`, whose activation relinks every `/etc` file to the
+//! store unconditionally — including the `/etc/fstab` UDisks2 had just
+//! replaced. `Block.Configuration` therefore changes again as a consequence of
+//! our own report. [`recent`] holds its stamp long enough to outlast a rebuild
+//! for that reason, and the monitor path is immune by construction: a rebuild
+//! makes no D-Bus method call. Note that until that rebuild completes,
+//! `/etc/fstab` is a regular file diverging from the Nix configuration.
+//!
+//! For the property path: a new `fstab` entry is a mount, a removed entry is an
 //! unmount, a changed `dir` is a mount point change (unmount followed by a
 //! mount), and a changed `opts` on an otherwise unchanged entry is a mount
-//! options change. LUKS partitions are covered the same way: once unlocked,
-//! the cleartext mapper device gains its own `Filesystem` interface and its
-//! own `Configuration`/`fstab` entry, and is watched identically;
-//! [`mount_info`] resolves the disk UUID, mapper device name and real
-//! (locked) device name back from the backing device in that case.
+//! options change. LUKS partitions are covered the same way: once unlocked, the
+//! cleartext mapper device gains its own `Filesystem` interface and its own
+//! `Configuration`/`fstab` entry, and is watched identically; [`mount_info`]
+//! resolves the disk UUID, mapper device name and real (locked) device name
+//! back from the backing device in that case.
 //!
 //! Devices present at startup whose `fstab` entry is already configured are
 //! not reported (no configuration change happened during our lifetime).
@@ -29,23 +59,23 @@
 //!
 //! # Reporting and blocking
 //! Every reported mount/unmount/options-change event is handed off to the
-//! external library (currently stubbed as a log line plus, in release
-//! builds, a `println!`; see `mount_info`). Once wired to the real library,
-//! that call edits the NixOS configuration and runs `nixos-rebuild`, which
-//! blocks for minutes; that call happens synchronously on the per-device
-//! watcher task, so only that device's task is blocked for the duration —
-//! other devices' watcher tasks run independently and keep processing their
-//! own events.
+//! external library (currently stubbed as a log line plus, unless
+//! [`crate::dry_run::is_dry_run`] is true, a `println!`; see `mount_info`).
+//! Once wired to the real library, that call edits the NixOS configuration and
+//! runs `nixos-rebuild`, which blocks for minutes; that call happens
+//! synchronously on the per-device watcher task, so only that device's task is
+//! blocked for the duration — other devices' watcher tasks run independently
+//! and keep processing their own events.
 //!
-//! # No debouncing or coalescing
-//! `Configuration` changes are read one at a time, in the order the D-Bus
-//! signal stream delivers them (`while let Some(change) =
-//! configuration_changes.next().await` in `watch_configuration`). A change
-//! that arrives while the previous one is still being processed is not
-//! dropped or merged with it: it queues up in the signal stream's internal
-//! buffer and is picked up, and reported, on the next loop iteration, once
-//! the current one has finished — including its (blocking, once wired)
-//! library call.
+//! # Coalescing
+//! `Configuration` changes are read one at a time, and the report for one is
+//! awaited in full before the next change is read. `zbus` does **not** queue
+//! property updates though: a `PropertyStream` only keeps the latest value, so
+//! changes arriving while the previous one is still being processed are merged
+//! rather than replayed one by one. This is harmless here because the logic is
+//! edge-based — each iteration compares the recorded baseline against a freshly
+//! read value — so the reports always converge on the current configuration,
+//! but no intermediate state is guaranteed to be seen.
 //!
 //! # UDisks2 not running
 //! [`Udisks2Listener::listen`] fetches the initial device list with
@@ -54,9 +84,15 @@
 //! and its error is propagated out of `listen` immediately: the listener
 //! never starts watching any device and the
 //! `InterfacesAdded`/`InterfacesRemoved` subscription is never set up.
+//! [`Udisks2MonitorListener`] has no such requirement.
 
+mod apply;
+mod intent;
+mod monitor;
 mod mount_info;
+mod pending;
 mod proxies;
+mod recent;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -70,8 +106,10 @@ use zbus::zvariant::OwnedObjectPath;
 
 use super::Listener;
 use crate::error::Error;
-use mount_info::MountInfo;
+use mount_info::{FstabEntry, FstabLookup, MountInfo};
 use proxies::BlockProxy;
+
+pub use monitor::Udisks2MonitorListener;
 
 /// D-Bus service name this listener watches.
 const SERVICE: &str = "org.freedesktop.UDisks2";
@@ -84,7 +122,7 @@ const MANAGER_PATH: &str = "/org/freedesktop/UDisks2";
 /// what starts/stops that device's `watch_configuration` task.
 const FILESYSTEM_INTERFACE: &str = "org.freedesktop.UDisks2.Filesystem";
 
-/// Listener for `org.freedesktop.UDisks2`.
+/// Listener for `org.freedesktop.UDisks2.Block.Configuration`.
 ///
 /// Zero-sized: all state lives in the `Connection` passed to
 /// [`Listener::listen`] and in the `Watchers` created for the duration of
@@ -111,8 +149,8 @@ impl Listener for Udisks2Listener {
     /// initial `get_managed_objects` call is not retried.
     ///
     /// # Post-conditions
-    /// Only returns if `connection` closes or a signal subscription/decoding
-    /// fails; otherwise loops forever over `InterfacesAdded`/
+    /// Returns `Ok(())` once both signal streams have ended (`connection`
+    /// closed); until then, loops forever over `InterfacesAdded`/
     /// `InterfacesRemoved`, starting or stopping a `watch_configuration` task
     /// (via `Watchers`) as each device's `Filesystem` interface
     /// appears/disappears.
@@ -167,6 +205,7 @@ impl Listener for Udisks2Listener {
                         watchers.remove(&OwnedObjectPath::from(args.object_path().to_owned()));
                     }
                 }
+                else => return Ok(()),
             }
         }
     }
@@ -174,17 +213,23 @@ impl Listener for Udisks2Listener {
 
 /// Per-object watcher tasks for `Block.Configuration`, keyed by object path
 /// so they can be aborted when the device disappears.
-#[derive(Default, Clone)]
+#[derive(Default)]
 struct Watchers(
     /// Map from a watched device's object path to the `tokio` task running
-    /// `watch_configuration` for it. Shared (`Arc<Mutex<_>>`) so the same
-    /// `Watchers` handle can be cloned into the signal-handling loop while
-    /// still being read/written from both `spawn` and `remove`.
+    /// `watch_configuration` for it. Behind `Arc<Mutex<_>>` so the spawned
+    /// tasks and the signal-handling loop can share it.
     Arc<Mutex<HashMap<OwnedObjectPath, JoinHandle<()>>>>,
 );
 
 impl Watchers {
-    /// Spawn a watcher for `path`, aborting any previous watcher for the same path.
+    /// Spawn a watcher for `path`, unless one is already running for it.
+    ///
+    /// A device can be reported both by the initial `get_managed_objects` list
+    /// and by an `InterfacesAdded` signal. Keeping the running watcher rather
+    /// than replacing it preserves its baseline, which is what stops an
+    /// already-configured device from being reported as a fresh mount. A
+    /// watcher that has already exited (it failed, see the post-conditions) is
+    /// replaced.
     ///
     /// `report_initial_config` controls how an already-configured `fstab`
     /// entry baseline is treated: `false` for devices present at startup
@@ -199,16 +244,23 @@ impl Watchers {
     /// * `report_initial_config` - as described above.
     ///
     /// # Post-conditions
-    /// A `watch_configuration` task for `path` is running, replacing any
-    /// previous one registered for the same `path`, which is aborted. A task
-    /// that later fails (any `Err` from `watch_configuration`, e.g. a lost
-    /// D-Bus connection) logs the error and exits; it is not restarted or
-    /// removed from this map by itself.
+    /// A `watch_configuration` task for `path` is running: either the one that
+    /// already was, or a newly spawned one. A task that later fails (any `Err`
+    /// from `watch_configuration`, e.g. a lost D-Bus connection) logs the error
+    /// and exits; it stays in this map until the device disappears or until
+    /// this method is called again for the same `path`, which then replaces it.
     ///
     /// # Panics
     /// Panics if the internal mutex is poisoned (a previous holder panicked
     /// while holding the lock).
     fn spawn(&self, connection: &Connection, path: OwnedObjectPath, report_initial_config: bool) {
+        let mut watchers = self.0.lock().expect("lock poisoned");
+
+        if watchers.get(&path).is_some_and(|w| !w.is_finished()) {
+            tracing::debug!(path = %path, "udisks2: already watched, keeping its baseline");
+            return;
+        }
+
         let connection = connection.clone();
         let task_path = path.clone();
         let handle = tokio::spawn(async move {
@@ -219,7 +271,7 @@ impl Watchers {
             }
         });
 
-        if let Some(previous) = self.0.lock().expect("lock poisoned").insert(path, handle) {
+        if let Some(previous) = watchers.insert(path, handle) {
             previous.abort();
         }
     }
@@ -266,14 +318,17 @@ impl Watchers {
 ///
 /// # Post-conditions
 /// Runs for as long as the `Configuration` property-change stream keeps
-/// yielding, processing one change at a time: gathering `MountInfo` and
-/// reporting a mount/unmount/options-change to the external library are
-/// awaited in full before the next change is read off the stream, so changes
-/// are neither debounced nor coalesced — one arriving mid-processing is
-/// simply queued in the stream and handled on the next iteration. A failure
-/// to *report* a mount (`mount_info::report_mount` returning `Err`) is only
-/// logged: it does not stop the loop, and `current` is still updated to the
-/// new entry as if the report had succeeded.
+/// yielding, processing one change at a time: gathering [`MountInfo`] and
+/// reporting to the external library are awaited in full before the next
+/// change is read off the stream (see the module-level docs on coalescing).
+/// A change [`recent::is_echo`] recognises as the echo of an already-reported
+/// method call still updates the baseline but is not reported again, and
+/// neither is a `Configuration` whose `fstab` entry is present but unreadable
+/// ([`FstabLookup::Malformed`]) — that leaves the baseline untouched rather
+/// than passing for an unmount. A failure to *report* a mount
+/// (`mount_info::report_mount` returning `Err`) is only logged: it does not
+/// stop the loop, and the baseline is still updated as if the report had
+/// succeeded.
 ///
 /// # Errors
 /// Propagates any error from building the `BlockProxy`, from reading a
@@ -285,7 +340,7 @@ async fn watch_configuration(
     path: &OwnedObjectPath,
     report_initial_config: bool,
 ) -> Result<(), Error> {
-    tracing::debug!(path = %path, "udisks2: watching block configuration");
+    tracing::info!(path = %path, "udisks2: watching block configuration");
 
     let block = BlockProxy::builder(connection).path(path)?.build().await?;
     let mut configuration_changes = block.receive_configuration_changed().await;
@@ -295,63 +350,152 @@ async fn watch_configuration(
 
     while let Some(change) = configuration_changes.next().await {
         let configuration = change.get().await?;
-        let entry = mount_info::fstab_entry(&configuration);
-        tracing::debug!(path = %path, configured = entry.is_some(), first, "udisks2: Configuration changed");
+        let lookup = mount_info::fstab_entry(&configuration);
+        tracing::info!(
+            path = %path,
+            lookup = ?lookup,
+            first,
+            "udisks2: Configuration changed"
+        );
 
         if first {
-            if let Some(entry) = entry {
-                let (info, backing_device) =
-                    mount_info::gather(connection, path, entry.mount_point, entry.options).await?;
-                if report_initial_config
-                    && let Err(err) =
-                        mount_info::report_mount(connection, path, &info, &backing_device).await
-                {
-                    tracing::error!(path = %path, %err, "failed to report partition mount");
-                }
-                current = Some(info);
-            }
             first = false;
+            if let FstabLookup::Entry(entry) = lookup {
+                current = Some(mount(connection, &block, entry, !report_initial_config).await?);
+            }
             continue;
         }
 
-        match (current.take(), entry) {
-            (None, None) => {}
-            (None, Some(entry)) => {
-                let (info, backing_device) =
-                    mount_info::gather(connection, path, entry.mount_point, entry.options).await?;
-                if let Err(err) =
-                    mount_info::report_mount(connection, path, &info, &backing_device).await
-                {
-                    tracing::error!(path = %path, %err, "failed to report partition mount");
-                }
-                current = Some(info);
-            }
-            (Some(info), None) => {
-                mount_info::report_unmount(&info);
-            }
-            (Some(info), Some(entry)) if info.mount_point != entry.mount_point => {
-                mount_info::report_unmount(&info);
+        let suppress = recent::is_echo(path);
+        if suppress {
+            tracing::debug!(path = %path, "udisks2: echo of an intercepted call, not reported");
+        }
 
-                let (info, backing_device) =
-                    mount_info::gather(connection, path, entry.mount_point, entry.options).await?;
-                if let Err(err) =
-                    mount_info::report_mount(connection, path, &info, &backing_device).await
-                {
-                    tracing::error!(path = %path, %err, "failed to report partition mount");
-                }
-                current = Some(info);
+        match (current.take(), lookup) {
+            (previous, FstabLookup::Malformed) => {
+                tracing::warn!(path = %path, "udisks2: unreadable fstab entry, state left unchanged");
+                current = previous;
             }
-            (Some(mut info), Some(entry)) => {
-                if info.options != entry.options {
-                    mount_info::report_options_changed(&info, &entry.options);
-                    info.options = entry.options;
+            (None, FstabLookup::Absent) => {}
+            (None, FstabLookup::Entry(entry)) => {
+                current = Some(mount(connection, &block, entry, suppress).await?);
+            }
+            (Some(info), FstabLookup::Absent) => {
+                if !suppress && let Err(err) = mount_info::report_unmount(&info).await {
+                    tracing::error!(%err, "failed to report partition unmount");
                 }
-                current = Some(info);
+            }
+            (Some(info), FstabLookup::Entry(entry)) if info.mount_point != entry.mount_point => {
+                if !suppress && let Err(err) = mount_info::report_unmount(&info).await {
+                    tracing::error!(%err, "failed to report partition unmount");
+                }
+                current = Some(mount(connection, &block, entry, suppress).await?);
+            }
+            (Some(info), FstabLookup::Entry(entry)) => {
+                current = Some(remount(connection, &block, info, entry, suppress).await?);
             }
         }
     }
 
     Ok(())
+}
+
+/// Gather the [`MountInfo`] for `entry` and, unless `suppress`, report it as a
+/// mount.
+///
+/// # Parameters
+/// * `connection` - connection used to query the backing device of an
+///   encrypted device.
+/// * `block` - `Block` proxy for the device being mounted.
+/// * `entry` - the device's `fstab` entry, source of the mount point and
+///   options.
+/// * `suppress` - when `true`, gather but do not report (the change is a
+///   baseline, or the echo of an already-reported method call).
+///
+/// # Returns
+/// The gathered [`MountInfo`], to become the caller's new baseline.
+///
+/// # Post-conditions
+/// A failure to report is logged, not propagated: the returned [`MountInfo`]
+/// is the new baseline either way.
+///
+/// # Errors
+/// Any [`Error`] from `mount_info::gather`.
+async fn mount(
+    connection: &Connection,
+    block: &BlockProxy<'_>,
+    entry: FstabEntry,
+    suppress: bool,
+) -> Result<MountInfo, Error> {
+    let (info, backing_device) =
+        mount_info::gather(connection, block, entry.mount_point, entry.options).await?;
+
+    if !suppress
+        && let Err(err) = mount_info::report_mount(connection, block, &info, &backing_device).await
+    {
+        tracing::error!(%err, "failed to report partition mount");
+    }
+
+    Ok(info)
+}
+
+/// Re-gather a still-configured device whose mount point did not change, and
+/// report whatever actually changed.
+///
+/// Re-gathering rather than only diffing `entry` against `info` is what catches
+/// a device swap at the same mount point: `Block.IdUUID` and `Block.IdType` are
+/// not part of the `fstab` entry, so a changed disk or filesystem type is
+/// otherwise invisible.
+///
+/// # Parameters
+/// * `connection` - connection used to query the backing device of an
+///   encrypted device.
+/// * `block` - `Block` proxy for the device.
+/// * `info` - the current baseline for this device.
+/// * `entry` - its freshly read `fstab` entry; same mount point as `info`.
+/// * `suppress` - when `true`, re-gather but do not report.
+///
+/// # Returns
+/// The freshly gathered [`MountInfo`], to become the caller's new baseline.
+///
+/// # Post-conditions
+/// A different disk or filesystem type is reported as an unmount of `info`
+/// followed by a mount of the fresh information; otherwise a different set of
+/// options (see `mount_info::same_options`) is reported as an options change,
+/// and an unchanged device is not reported at all. A failure to report is
+/// logged, not propagated.
+///
+/// # Errors
+/// Any [`Error`] from `mount_info::gather`.
+async fn remount(
+    connection: &Connection,
+    block: &BlockProxy<'_>,
+    info: MountInfo,
+    entry: FstabEntry,
+    suppress: bool,
+) -> Result<MountInfo, Error> {
+    let (fresh, backing_device) =
+        mount_info::gather(connection, block, entry.mount_point, entry.options).await?;
+
+    if suppress {
+        return Ok(fresh);
+    }
+
+    if fresh.disk_path != info.disk_path || fresh.filesystem_type != info.filesystem_type {
+        if let Err(err) = mount_info::report_unmount(&info).await {
+            tracing::error!(%err, "failed to report partition unmount");
+        }
+        if let Err(err) = mount_info::report_mount(connection, block, &fresh, &backing_device).await
+        {
+            tracing::error!(%err, "failed to report partition mount");
+        }
+    } else if !mount_info::same_options(&info.options, &fresh.options)
+        && let Err(err) = mount_info::report_options_changed(&info, &fresh.options).await
+    {
+        tracing::error!(%err, "failed to report partition options change");
+    }
+
+    Ok(fresh)
 }
 
 #[cfg(test)]

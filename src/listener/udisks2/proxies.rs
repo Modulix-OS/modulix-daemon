@@ -104,3 +104,7 @@ pub trait Block {
     #[zbus(property)]
     fn preferred_device(&self) -> zbus::Result<Vec<u8>>;
 }
+
+#[cfg(test)]
+#[path = "proxies-tests.rs"]
+mod tests;

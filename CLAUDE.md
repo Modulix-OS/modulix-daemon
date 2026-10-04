@@ -29,8 +29,8 @@ NixOS integration: `flake.nix` exposes `nixosModules.mx-daemon`; enable via `ser
 
 ## Project-specific conventions
 
-- **Library calls are stubbed as prints (for now).** Every place that would call the user's external library currently does a `println!`/log instead. Each call is **preceded by an info-level log** describing the operation being performed.
-- **Library calls run in release only.** Gate the actual library invocation (the print) behind `#[cfg(not(debug_assertions))]` (or equivalent release check). Debug builds log the intent but skip the call. This applies to both the existing-interface handlers and the daemon's own-interface commands.
+- **Every library call is preceded by an info-level log** describing the operation being performed. Some handlers still stub the call itself as a `println!` (see `src/command/setting.rs`); the install/uninstall commands, the system update and the UDisks2 mount path call `modulix-core-utils` for real.
+- **Dry run is a runtime choice, not a build profile.** Gate the actual library invocation behind `crate::dry_run::is_dry_run()` (`src/dry_run.rs`), driven by `MX_DAEMON_DRY_RUN` and defaulting to the build profile when unset. The old `#[cfg(not(debug_assertions))]` gate is gone: it made the debug build unable to exercise the real path, which is exactly what `nix build .#mx-daemon-test` needs to do.
 - **Per-file test files.** Each `src/foo.rs` has a sibling `src/foo-tests.rs` holding its unit tests. Wire it in from `foo.rs` with:
   ```rust
   #[cfg(test)]
@@ -45,14 +45,23 @@ NixOS integration: `flake.nix` exposes `nixosModules.mx-daemon`; enable via `ser
 
 Genericity via traits so new listened interfaces and new own-interface commands are cheap to add.
 
-- **Listened interfaces** (e.g. UDisks2): one trait abstracting "subscribe to a DBus interface and handle its events". Each interface = one impl. First impl watches `org.freedesktop.UDisks2.Block.Configuration` (the `fstab`/`crypttab` entries UDisks2 re-reads from `/etc/fstab`): a new entry reports a mount, a removed entry an unmount, a changed `dir` an unmount+mount, a changed `opts` (same `dir`) an options change. LUKS partitions are covered the same way once unlocked (the mapper device gets its own `Configuration`). Payload to the library: mount point, disk path (by UUID), filesystem type, mount options (+ mapper/backing device names for LUKS).
+- **Listened interfaces** (e.g. UDisks2): one trait abstracting "subscribe to a DBus interface and handle its events". Each interface = one impl. UDisks2 has **two** impls, see below. The property one watches `org.freedesktop.UDisks2.Block.Configuration` (the `fstab`/`crypttab` entries UDisks2 re-reads from `/etc/fstab`): a new entry reports a mount, a removed entry an unmount, a changed `dir` an unmount+mount, a changed `opts` (same `dir`) an options change. LUKS partitions are covered the same way once unlocked (the mapper device gets its own `Configuration`). Payload to the library: mount point, disk path (by UUID), filesystem type, mount options (+ mapper/backing device names for LUKS).
 
-> **fstab listener trigger.** The UDisks2 listener reacts to `Block.Configuration` changes (`/etc/fstab` edits as seen by UDisks2), not to actual mount/unmount D-Bus calls — UDisks2 has no generic "mounted/unmounted" signal across filesystems. A configuration change is the proxy for "the user wants this mounted/unmounted/remounted".
-- **Listened interfaces** (hostname1): watches `org.freedesktop.hostname1`'s `Hostname` property (`sender: org.freedesktop.hostname1`, `interface: org.freedesktop.DBus.Properties`, `member: PropertiesChanged`) via zbus's generated `receive_hostname_changed`. On change, reports the new hostname to the external library.
+> **fstab listener trigger — the method call is the primary one.** UDisks2 has no generic "mounted/unmounted" signal, so the trigger is the `fstab` configuration change. There are two ways to observe it and the daemon uses both, `Udisks2MonitorListener` first:
+>
+> 1. **`Block` method calls** (`src/listener/udisks2/monitor.rs`): a `BecomeMonitor` match rule on `AddConfigurationItem`/`RemoveConfigurationItem`/`UpdateConfigurationItem`. This is the primary path. It sees the request itself, is not subject to the property stream's coalescing, carries the old *and* new item on an update (so no baseline state is needed), and — decisively — **cannot be triggered by our own `nixos-rebuild`**.
+> 2. **The `Block.Configuration` property** (`src/listener/udisks2/mod.rs`): covers an `/etc/fstab` change made outside D-Bus and the state of a device as it appears.
+>
+> Three facts to keep in mind when touching this (all verified, do not re-derive):
+>
+> - **The write succeeds.** `/etc/fstab` is a symlink to `/etc/static/fstab` → the store, but `/etc` is writable by root and `udisksd` uses `g_file_set_contents` (temp file + `rename`), which replaces the symlink with a regular file. Both paths therefore fire on a successful call.
+> - **Feedback loop.** `nixos-rebuild switch` activation (`setup-etc.pl`) relinks every `/etc` file to the store unconditionally, so our own write makes `Block.Configuration` change again. `src/listener/udisks2/recent.rs` stamps a device before the monitor reports and the property watcher skips the echo; its window outlasts a rebuild.
+> - **polkit refuses by default.** `org.freedesktop.udisks2.modify-system-configuration` is `auth_admin` on `allow_any`/`allow_inactive`/`allow_active`. **A monitor sees the call, not its outcome**, so acting on the call alone would apply a change polkit refused. `src/listener/udisks2/pending.rs` parks each call by serial and only reports on `method_return`; an `error` reply is dropped. Never bypass this. A test from a plain terminal needs `pkttyagent --process $$ &` or it will be denied — the most likely reason the listener looks silent.
+- **Listened interfaces** (hostname1): monitors the `SetStaticHostname`/`SetHostname` **method calls** (`BecomeMonitor` on a dedicated connection), not the `Hostname` property — `hostname1` emits no `PropertiesChanged` when its write under `/etc` fails. On a call, reports the new hostname to the external library. Note it does **not** yet correlate the reply the way `udisks2/pending.rs` does, so it acts on unauthorised attempts too.
 - **Own interface** (`org.modulix.Daemon`): commands exposed via zbus's `#[interface]`, each command kept thin and delegating to a handler. First command: install/uninstall a system package given only a package name.
 - Use **zbus** as the DBus crate. Prefer `Arc<Mutex<T>>` for shared state (global rule).
 
-Adding work = add a new trait impl (listened interface) or a new interface method + handler (own interface); both funnel into the "info log → release-gated library call" pattern above.
+Adding work = add a new trait impl (listened interface) or a new interface method + handler (own interface); both funnel into the "info log → dry-run-gated library call" pattern above.
 
 ## System updates (`Store1.CheckUpdate` + `Daemon.UpdateSystem`)
 
@@ -82,3 +91,45 @@ the daemon splits it into a *search* and an *apply* that share one resolution:
 `CheckUpdate` needs no polkit action (it is a `Store1` read) and no new
 `Command` impl, so `org.modulix.daemon.policy`, `org.modulix.Daemon.conf` and
 `command::registry()` are all untouched by it.
+
+## Mount changes (`fstab.nix` write path)
+
+`src/listener/udisks2/apply.rs` is the write half of the UDisks2 listeners:
+`mount_info`'s `report_*` decide *what* happened, `apply` makes it stick.
+
+- `apply::mount` → `filesystem::add_mount`, `apply::unmount` →
+  `filesystem::remove_mount`, both on `tokio::task::spawn_blocking` (the
+  core-utils API is synchronous) and behind `APPLY_GUARD`, a
+  `tokio::sync::Mutex` — two concurrent rebuilds would fight over the same git
+  tree. Same shape as `src/command/lifecycle.rs:99-108`.
+- An options change is a **re-declaration**: `add_mount` resets `.options`
+  before writing, so passing the new list is enough. Options are written
+  verbatim, in the user's order, not normalised.
+
+**No LUKS logic in this repo.** The boundary is: UDisks2 knows the *facts*
+(`CryptoBackingDevice` says it is an unlocked LUKS volume, `IdUUID` of the
+backing device is the container, `PreferredDevice` is the mapper in use), and
+`mount_info` reads them because that needs `zbus`, which core-utils does not
+have. Everything that *follows* from those facts is
+`filesystem::MountDevice`'s: the mapper name to declare, the
+`boot.initrd.luks.devices` entry, the TPM2 attribute, and dropping that entry
+again on removal. `apply::mount` therefore only builds
+`MountDevice::Plain { device }` or
+`MountDevice::Luks { container, mapper_device, tpm2: false }` and hands it over.
+`grep -rn "LuksEntry\|default_luks_name\|mapper_name" src/` must stay empty.
+
+`tpm2: false` is safe to pass always: core-utils never resets
+`crypttabExtraOpts`, so `false` means "do not add it", not "remove it", and an
+existing enrolment survives. An `fstab` entry could not tell us anyway.
+
+Two `modulix-core-utils` limitations this path lives with (documented in
+`apply.rs`, not worked around):
+
+1. **One rebuild per entry.** Only the transactional wrappers are public (the
+   `*_no_transaction` ones take a `NixFile`, which is not), so a burst of mount
+   changes cannot share a rebuild.
+2. **No read API.** No `list_entries`/`get_entry`, so the daemon cannot know
+   whether what it is about to write is already there; `remove_mount` rebuilds
+   even when it removed nothing.
+
+Fixing either belongs in `modulix-core-utils`, not here.

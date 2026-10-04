@@ -76,6 +76,7 @@ pub trait Listener: Send + Sync {
 /// independently — see the module-level docs).
 pub fn registry() -> Vec<Box<dyn Listener>> {
     vec![
+        Box::new(udisks2::Udisks2MonitorListener),
         Box::new(udisks2::Udisks2Listener),
         Box::new(hostname1::Hostname1Listener),
     ]

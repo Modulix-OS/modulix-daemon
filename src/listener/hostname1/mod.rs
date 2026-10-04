@@ -12,7 +12,7 @@
 //! `nixos-rebuild`, blocking for minutes (same kind of blocking as the
 //! daemon's own-interface commands, e.g.
 //! `crate::daemon::Daemon::install_package`); that call is currently
-//! stubbed out as a `println!` that only runs in release builds, see
+//! stubbed out as a `println!` skipped on a dry run, see
 //! [`report_hostname_changed`].
 //!
 //! If `systemd-hostnamed` is not running (or not installed), setting up the
@@ -134,17 +134,18 @@ impl Listener for Hostname1Listener {
 ///   argument (no validation is performed here).
 ///
 /// # Post-conditions
-/// Always logs the change at info level. In release builds only
-/// (`#[cfg(not(debug_assertions))]`), also prints `set-hostname {hostname}`
+/// Always logs the change at info level. Unless
+/// [`crate::dry_run::is_dry_run`] is true, also prints `set-hostname {hostname}`
 /// to stdout — the current stand-in for calling the external library that
 /// writes the new hostname into the Modulix NixOS configuration and runs
 /// the resulting `nixos-rebuild`, which blocks for minutes (see the
-/// module-level docs). Debug builds only log the intent and skip that call.
+/// module-level docs). A dry run only logs the intent and skips that call.
 fn report_hostname_changed(hostname: &str) {
     tracing::info!(hostname, "detected pretty hostname change request");
 
-    #[cfg(not(debug_assertions))]
-    println!("set-hostname {hostname}");
+    if !crate::dry_run::is_dry_run() {
+        println!("set-hostname {hostname}");
+    }
 }
 
 #[cfg(test)]

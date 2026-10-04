@@ -77,7 +77,6 @@ const INSTALLED_CACHE_TTL: Duration = Duration::from_secs(5);
 /// clears this early via [`invalidate_updates`].
 const UPDATE_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
-
 /// Ceiling on `nix eval` invocations a single `GetPackageLicenses` call may
 /// trigger. GNOME Software asks for a license on the details page (one app),
 /// so this only bounds a pathological caller passing a whole search page.
@@ -292,7 +291,6 @@ fn installed_cache() -> &'static FlightCache<(), Arc<InstalledSets>> {
 fn update_cache() -> &'static FlightCache<(), Arc<Vec<InputEntry>>> {
     UPDATE_CACHE.get_or_init(|| FlightCache::new(UPDATE_CACHE_TTL, 1))
 }
-
 
 /// The cached installed sets. Behind an `Arc`: one search stamps hundreds of
 /// entries against the same snapshot, and cloning the sets each time would

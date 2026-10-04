@@ -14,10 +14,9 @@
 //! `modulix-core-utils` library call is **not implemented yet** here: each
 //! branch below only `println!`s a stand-in line describing the intended
 //! call, and neither function triggers a Nix file edit, a git transaction or
-//! a `nixos-rebuild`. That stand-in is also gated differently from the rest
-//! of the crate - via the compile-time `#[cfg(not(debug_assertions))]`
-//! (release-only), not the runtime [`crate::dry_run::is_dry_run`] check
-//! every other command in this module uses.
+//! a `nixos-rebuild`. That stand-in is gated by the same runtime
+//! [`crate::dry_run::is_dry_run`] check every other command in this module
+//! uses.
 
 use crate::error::Error;
 
@@ -42,10 +41,10 @@ pub type Setting = (String, String, bool);
 /// * `(name, value, reset)` - see [`Setting`].
 ///
 /// # Post-conditions
-/// In a release build (`#[cfg(not(debug_assertions))]`), prints
+/// Unless [`crate::dry_run::is_dry_run`] is true, prints
 /// `"reset-option {name}"` (when `reset`) or `"set-option {name} {value}"`
 /// (otherwise) as a stand-in for the not-yet-implemented
-/// `modulix-core-utils` call; in a debug build nothing beyond the
+/// `modulix-core-utils` call; in a dry run nothing beyond the
 /// `tracing::info!` call happens. No Nix file, git transaction or
 /// `nixos-rebuild` is touched by either path today.
 ///
@@ -60,15 +59,17 @@ pub(crate) async fn apply_option((name, value, reset): &Setting) -> Result<Strin
     if *reset {
         tracing::info!(option = %name, "resetting option to default");
 
-        #[cfg(not(debug_assertions))]
-        println!("reset-option {name}");
+        if !crate::dry_run::is_dry_run() {
+            println!("reset-option {name}");
+        }
 
         Ok(format!("option {name} reset to default"))
     } else {
         tracing::info!(option = %name, value = %value, "setting option");
 
-        #[cfg(not(debug_assertions))]
-        println!("set-option {name} {value}");
+        if !crate::dry_run::is_dry_run() {
+            println!("set-option {name} {value}");
+        }
 
         Ok(format!("option {name} set to {value}"))
     }
@@ -82,10 +83,10 @@ pub(crate) async fn apply_option((name, value, reset): &Setting) -> Result<Strin
 ///   list and `value` the entry being set/added.
 ///
 /// # Post-conditions
-/// In a release build (`#[cfg(not(debug_assertions))]`), prints
+/// Unless [`crate::dry_run::is_dry_run`] is true, prints
 /// `"reset-list {name}"` (when `reset`) or `"set-list {name} {value}"`
 /// (otherwise) as a stand-in for the not-yet-implemented
-/// `modulix-core-utils` call; in a debug build nothing beyond the
+/// `modulix-core-utils` call; in a dry run nothing beyond the
 /// `tracing::info!` call happens. No Nix file, git transaction or
 /// `nixos-rebuild` is touched by either path today.
 ///
@@ -100,15 +101,17 @@ pub(crate) async fn apply_list((name, value, reset): &Setting) -> Result<String,
     if *reset {
         tracing::info!(list = %name, "resetting list to default");
 
-        #[cfg(not(debug_assertions))]
-        println!("reset-list {name}");
+        if !crate::dry_run::is_dry_run() {
+            println!("reset-list {name}");
+        }
 
         Ok(format!("list {name} reset to default"))
     } else {
         tracing::info!(list = %name, value = %value, "setting list entry");
 
-        #[cfg(not(debug_assertions))]
-        println!("set-list {name} {value}");
+        if !crate::dry_run::is_dry_run() {
+            println!("set-list {name} {value}");
+        }
 
         Ok(format!("list {name} entry set to {value}"))
     }

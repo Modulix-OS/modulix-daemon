@@ -9,7 +9,7 @@ mod module;
 mod package;
 mod plugin;
 pub(crate) mod setting;
-mod update;
+pub(crate) mod update;
 
 use async_trait::async_trait;
 

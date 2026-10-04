@@ -138,10 +138,13 @@ static UPDATE_CACHE: OnceLock<FlightCache<(), Arc<Vec<InputEntry>>>> = OnceLock:
 ///
 /// Deliberately **not** a [`FlightCache`]: there is no TTL to honour and the
 /// value is normally taken, not read — it is overwritten by the next check and
-/// emptied by [`take_pending_lock`] (only `"build"` mode reads it without
-/// consuming it, through [`peek_pending_lock`]). Holding it means the revisions
-/// `UpdateSystem` applies are exactly the ones the check announced, at the cost
-/// of one lockfile's worth of memory.
+/// emptied by [`take_pending_lock`], whose only caller is
+/// [`crate::staging::stage`]: the staging path takes the candidate instead of
+/// re-probing, and from there it lives on disk
+/// (`modulix_core_utils::staging`), which is what survives a daemon restart.
+/// Holding it means the revisions staged are exactly the ones the check
+/// announced, at the cost of one lockfile's worth of memory and one network
+/// probe instead of two.
 static PENDING_LOCK: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Serialises [`Store::check_update`]: the probe is an unprivileged,
@@ -505,26 +508,6 @@ pub fn take_pending_lock() -> Option<String> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
-}
-
-/// Hands over a copy of the candidate `flake.lock`, leaving the slot filled.
-///
-/// The read-only counterpart of [`take_pending_lock`], for `UpdateSystem`'s
-/// `"build"` mode: pre-building the candidate must not consume it, or the
-/// `"switch"`/`"boot"` that follows would resolve a fresh lockfile and could
-/// install different revisions than the ones just built.
-///
-/// # Returns
-/// `Some(lockfile)` when a check found an update and nothing consumed it yet,
-/// `None` in the same cases as [`take_pending_lock`].
-///
-/// # Post-conditions
-/// [`PENDING_LOCK`] is left exactly as it was.
-pub fn peek_pending_lock() -> Option<String> {
-    PENDING_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
 }
 
 /// Drops the candidate `flake.lock`, if any.
@@ -1185,6 +1168,82 @@ impl Store {
         *PENDING_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = candidate;
         Ok(found)
     }
+
+    /// Serves `StagedUpdate() -> (bbt)`: whether an update is waiting to be
+    /// applied, and whether it is ready to be applied cheaply.
+    ///
+    /// This is what a "restart to finish updating" prompt reads. A Modulix
+    /// update is never applied while the machine is in use: it is resolved and
+    /// pre-built in the background, and the switch happens at shutdown
+    /// (`mx-apply-update.service`). So an up-to-date system and a system with
+    /// everything downloaded and waiting for a reboot look identical to
+    /// [`list_outdated_inputs`](Store::list_outdated_inputs) - this call is how
+    /// they are told apart.
+    ///
+    /// # Returns
+    /// `(staged, built, created_at)`:
+    /// * `staged` - an update is waiting.
+    /// * `built` - its closure is realised in the store **and** still rooted,
+    ///   so applying it at shutdown costs seconds. Reported as `false` once the
+    ///   pre-built closure has been garbage-collected, in which case the next
+    ///   background staging rebuilds it.
+    /// * `created_at` - when it was staged, Unix seconds; `0` when nothing is
+    ///   staged.
+    ///
+    /// # Post-conditions
+    /// A pure read: no process is spawned, nothing is written, and it does not
+    /// block - unlike [`check_update`](Store::check_update), which probes the
+    /// network. Safe to poll.
+    ///
+    /// # Errors
+    /// Never returns `Err`: an unreadable staging area is logged and reported
+    /// as "nothing staged", which is what a caller would do with the error
+    /// anyway.
+    async fn staged_update(&self) -> zbus::fdo::Result<(bool, bool, u64)> {
+        match modulix_core_utils::staging::staged_status() {
+            Ok(Some(status)) => Ok((true, status.built, status.created_at)),
+            Ok(None) => Ok((false, false, 0)),
+            Err(e) => {
+                tracing::warn!(error = %e, "staged_update");
+                Ok((false, false, 0))
+            }
+        }
+    }
+
+    /// Serves `ListStagedInputs() -> aa{sv}`: what the staged update would
+    /// change, input by input.
+    ///
+    /// Same row shape as
+    /// [`list_outdated_inputs`](Store::list_outdated_inputs), but read from the
+    /// staged candidate recorded on disk instead of from a fresh probe, so it
+    /// describes exactly what the next boot will carry.
+    ///
+    /// # Returns
+    /// One `a{sv}` per direct input whose revision the staged update moves, in
+    /// the order the candidate was diffed in. Empty when nothing is staged.
+    ///
+    /// # Post-conditions
+    /// A pure read, like [`staged_update`](Store::staged_update).
+    ///
+    /// # Errors
+    /// Never returns `Err`; an unreadable staging area yields an empty list.
+    async fn list_staged_inputs(&self) -> zbus::fdo::Result<Vec<Dict>> {
+        let status = match modulix_core_utils::staging::staged_status() {
+            Ok(Some(status)) => status,
+            Ok(None) => return Ok(Vec::new()),
+            Err(e) => {
+                tracing::warn!(error = %e, "list_staged_inputs");
+                return Ok(Vec::new());
+            }
+        };
+
+        Ok(status
+            .inputs
+            .into_iter()
+            .map(InputEntry::from)
+            .map(InputEntry::into_dict)
+            .collect())
+    }
 }
 
 /// Diffs the configuration's current `flake.lock` against a candidate one,
@@ -1334,16 +1393,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn peek_pending_lock_does_not_consume_the_candidate() {
+    fn take_pending_lock_consumes_the_candidate() {
         *PENDING_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = Some("candidate".to_string());
 
-        assert_eq!(peek_pending_lock().as_deref(), Some("candidate"));
-        // The whole point of `peek`: `UpdateSystem("build")` reads the lockfile
-        // it is about to realise, and the `switch`/`boot` that follows must
-        // still find it.
-        assert_eq!(peek_pending_lock().as_deref(), Some("candidate"));
         assert_eq!(take_pending_lock().as_deref(), Some("candidate"));
-        assert_eq!(peek_pending_lock(), None);
+        assert_eq!(take_pending_lock(), None);
     }
 
     #[tokio::test]

@@ -10,8 +10,10 @@
 //! own transaction plus a full `nixos-rebuild switch`, which blocks for
 //! minutes. They therefore run on [`tokio::task::spawn_blocking`], the same way
 //! the own-interface commands do (see [`crate::lifecycle_commands`]), and one
-//! at a time behind [`APPLY_GUARD`]: two concurrent rebuilds on the same
-//! configuration repository would fight over the same git tree.
+//! at a time behind [`crate::rebuild::guard`], the lock every configuration
+//! transaction of this process takes: two concurrent rebuilds on the same
+//! configuration repository would fight over the same git tree, and the
+//! own-interface commands reach that tree too.
 //!
 //! # Dry run
 //! Every call is skipped — logged only — when [`crate::dry_run::is_dry_run`] is
@@ -38,17 +40,9 @@
 //!   nothing.
 
 use modulix_core_utils::filesystem::{self, MountDevice};
-use tokio::sync::Mutex;
 
 use super::mount_info::MountInfo;
 use crate::error::Error;
-
-/// Serialises the configuration transactions this module starts.
-///
-/// `modulix-core-utils` has its own inter-process build queue, but nothing
-/// stops two watcher tasks of this process from entering a transaction on the
-/// same git repository at once.
-static APPLY_GUARD: Mutex<()> = Mutex::const_new(());
 
 /// Declare `info` as a mount point in `fstab.nix`.
 ///
@@ -95,7 +89,8 @@ pub(super) async fn mount(info: &MountInfo, mapper_device: Option<&str>) -> Resu
     let options = option_list(&info.options);
     let mapper_device = mapper_device.map(str::to_string);
 
-    let _guard = APPLY_GUARD.lock().await;
+    let _in_flight = crate::shutdown::enter()?;
+    let _guard = crate::rebuild::guard().await;
     tokio::task::spawn_blocking(move || {
         let options: Vec<&str> = options.iter().map(String::as_str).collect();
         let device = match &mapper_device {
@@ -148,7 +143,8 @@ pub(super) async fn unmount(info: &MountInfo) -> Result<(), Error> {
 
     let mount_point = info.mount_point.clone();
 
-    let _guard = APPLY_GUARD.lock().await;
+    let _in_flight = crate::shutdown::enter()?;
+    let _guard = crate::rebuild::guard().await;
     let removed = tokio::task::spawn_blocking(move || {
         filesystem::remove_mount(crate::config_dir::config_dir(), &mount_point)
     })

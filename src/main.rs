@@ -61,6 +61,9 @@ mod dry_run;
 mod error;
 mod listener;
 mod polkit;
+mod rebuild;
+mod shutdown;
+mod staging;
 mod store;
 
 use std::time::Duration;
@@ -180,6 +183,37 @@ fn spawn_rebuild_signal_handler() -> Result<(), Error> {
 /// claiming [`daemon::BUS_NAME`], or registering either interface fails;
 /// and [`Error::Io`] if [`spawn_rebuild_signal_handler`] fails to register
 /// the SIGHUP handler.
+/// Recovers what an interrupted transaction left in the configuration
+/// repository, before anything is served.
+///
+/// A transaction is not interruptible and `modulix-core-utils` has no `Drop`
+/// on it, so a daemon killed mid-rebuild - which is what a `switch` that
+/// restarts this unit used to do - leaves its auto-stash behind with the
+/// caller's uncommitted work inside. Nothing notices on its own; this is where
+/// it gets noticed.
+///
+/// # Pre-conditions
+/// No transaction may be open, which at this point in [`main`] is guaranteed:
+/// the bus name is not claimed yet and no listener runs.
+///
+/// # Post-conditions
+/// Only stash entries this project created are touched. A failure is logged and
+/// swallowed: a repository that cannot be inspected is not a reason to refuse
+/// to start, since every command reports its own failure anyway.
+fn repair_configuration_repository() {
+    match modulix_core_utils::staging::repair_after_crash(config_dir::config_dir()) {
+        Ok(0) => (),
+        Ok(recovered) => tracing::warn!(
+            recovered,
+            "restored stash entries left behind by an interrupted transaction"
+        ),
+        Err(err) => tracing::error!(
+            %err,
+            "could not check the configuration repository for an interrupted transaction"
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt()
@@ -187,6 +221,8 @@ async fn main() -> Result<(), Error> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    repair_configuration_repository();
 
     let connection = zbus::connection::Builder::system()?
         .name(daemon::BUS_NAME)?
@@ -213,6 +249,8 @@ async fn main() -> Result<(), Error> {
     tokio::spawn(modulix_core_utils::package_index::ensure_fresh_in_background());
     spawn_index_refresh_timer();
     spawn_rebuild_signal_handler()?;
+    shutdown::spawn_signal_handler()?;
+    staging::spawn_background_stage(command::update::background_cores());
 
     std::future::pending::<Result<(), Error>>().await
 }

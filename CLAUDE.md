@@ -63,34 +63,88 @@ Genericity via traits so new listened interfaces and new own-interface commands 
 
 Adding work = add a new trait impl (listened interface) or a new interface method + handler (own interface); both funnel into the "info log → dry-run-gated library call" pattern above.
 
-## System updates (`Store1.CheckUpdate` + `Daemon.UpdateSystem`)
+## System updates — staged, applied at shutdown
 
-A NixOS system update is one transaction (`flake.lock` + `nixos-rebuild`), so
-the daemon splits it into a *search* and an *apply* that share one resolution:
+**A system update is never applied while the machine is in use.** No
+`UpdateSystem` mode switches the running system: the update is resolved and
+pre-built in the background, made the next boot's default, and takes effect on
+restart. The mechanism lives in `modulix_core_utils::staging`; this daemon
+drives it.
 
 - `Store1.CheckUpdate() -> b` (`src/store/mod.rs`) calls
   `modulix_core_utils::update::check_update`, which runs a full
   `nix flake update --output-lock-file <scratch>` — **nothing in the config
   directory is written**, so this stays on the unprivileged read interface. The
   resulting candidate `flake.lock` is parked in `PENDING_LOCK`, a plain
-  `Mutex<Option<String>>` next to the `FlightCache` statics: no TTL, take-once
-  semantics, overwritten by the next check. Concurrent callers queue behind
-  `CHECK_GUARD` (a `tokio::sync::Mutex`) instead of each spawning a refresh.
+  `Mutex<Option<String>>`: no TTL, take-once, overwritten by the next check.
+  Concurrent callers queue behind `CHECK_GUARD` (a `tokio::sync::Mutex`).
+  `PENDING_LOCK`'s only consumer is now `staging::stage`, which stages that
+  candidate instead of probing a second time; from there it lives on disk,
+  which is what survives a daemon restart.
 - The same call refills `UPDATE_CACHE` from `update::diff_locks`, a purely
   local diff of the two lockfiles. So `ListOutdatedInputs` right after is free
-  and consistent by construction with what an update would apply, instead of
-  re-probing each input with `nix flake metadata`.
-- `Daemon.UpdateSystem(mode)` (`src/command/update.rs`) takes the candidate
-  with `store::take_pending_lock()` and writes it through
-  `update::update_with_lock` (`UpdateInput::UseLock`), so the revisions
-  installed are the ones the check announced. No candidate pending ⇒ it runs
-  the probe itself; nothing to apply ⇒ `"system already up to date"`, no
-  rebuild. The candidate is consumed either way — a failed rebuild does not put
-  it back, the next check recomputes it.
+  and consistent by construction with what an update would apply.
+- `Store1.StagedUpdate() -> (bbt)` and `Store1.ListStagedInputs() -> aa{sv}`
+  are the read side of the staging area: `(staged, built, created_at)` and the
+  per-input rows of what the next boot will carry. Pure reads, no probe — this
+  is what a "restart to finish updating" prompt reads, since an up-to-date
+  system and one waiting for a reboot look identical to `ListOutdatedInputs`.
+- `Daemon.UpdateSystem(mode)` (`src/command/update.rs`), five modes:
+  - `"build"` / `"stage"` → `staging::stage_update`: resolve + `nixos-rebuild
+    build`, nothing applied. Half the cores.
+  - `"boot"` → stage if needed, then `staging::apply_staged`: the pre-built
+    system becomes the next boot's default. The running system is untouched.
+  - `"switch"` → **synonym of `"boot"`**, kept for the clients that still send
+    it. It does not switch; there is no in-use apply at all.
+  - `"apply"` → `apply_staged` only, no staging. Administrative escape hatch;
+    the normal path is the shutdown unit.
+  Dry run short-circuits every mode *including the probe*, returning the mode's
+  success message.
+- The apply normally comes from outside the daemon:
+  `mx-apply-update.service` (mxpkgs) runs core-utils' `mx-apply-update` binary
+  before `shutdown.target`.
 
-`CheckUpdate` needs no polkit action (it is a `Store1` read) and no new
-`Command` impl, so `org.modulix.daemon.policy`, `org.modulix.Daemon.conf` and
-`command::registry()` are all untouched by it.
+**Invariant: the committed `flake.lock` is the one the running system was built
+from.** The staged candidate lives under `cache_dir()/pending-update/`, never in
+the git tree, so an install that happens while an update waits commits with
+`UpdateInput::Keep` and cannot drag the update in. `apply_staged` promotes the
+candidate (commit without rebuild) only after the new system is built and
+registered as next boot's.
+
+`CheckUpdate`, `StagedUpdate` and `ListStagedInputs` need no polkit action (they
+are `Store1` reads) and no `Command` impl, so `org.modulix.daemon.policy`,
+`org.modulix.Daemon.conf` and `command::registry()` are untouched by them.
+
+## Crash safety (`src/shutdown.rs`, `src/rebuild.rs`)
+
+A configuration transaction is not interruptible: core-utils implements no
+`Drop` on its `Transaction` and keeps no journal, so a process killed between
+the commit and the end of the rebuild leaves the repository committed ahead of
+the running system, files sealed `chattr +i`, and an auto-stash nobody pops.
+Three things keep that from happening:
+
+- **The unit does not restart itself.** `systemd.services.modulix-daemon` in
+  mxpkgs sets `restartIfChanged = false`, `stopIfChanged = false` and
+  `KillMode = "process"`. Without them, `switch-to-configuration` restarts the
+  daemon during the very activation it started, and the default
+  `KillMode=control-group` takes `nixos-rebuild` *and*
+  `switch-to-configuration` down with it. A new binary therefore only takes
+  effect at the next boot or on an explicit `systemctl restart`.
+- **The rebuild lives in its own cgroup.** `Transaction::rebuild_config` wraps
+  the command in `systemd-run --collect --wait --pipe --unit=mx-rebuild-<pid>-<n>`
+  when `INVOCATION_ID` is set, so it survives any stop of the daemon unit. That
+  is also why the build scratch moved from `/tmp` to `cache_dir()`: with
+  `PrivateTmp`, a transient unit does not see the daemon's `/tmp`.
+- **`SIGTERM` drains instead of killing.** `shutdown::enter` refuses new
+  transactions once a signal arrived, `wait_drained` waits for the ones in
+  flight, then the process exits 0 — within the unit's `TimeoutStopSec`.
+  `main` calls `staging::repair_after_crash` before serving, which pops the
+  auto-stash a previous `SIGKILL` left behind.
+
+`rebuild::guard()` is the single lock every configuration transaction of this
+process takes: `Daemon::run` holds it for every command, and
+`listener/udisks2/apply.rs` for every mount change. It is **not reentrant** —
+code reached from `Daemon::run` must not take it again.
 
 ## Mount changes (`fstab.nix` write path)
 
@@ -99,9 +153,11 @@ the daemon splits it into a *search* and an *apply* that share one resolution:
 
 - `apply::mount` → `filesystem::add_mount`, `apply::unmount` →
   `filesystem::remove_mount`, both on `tokio::task::spawn_blocking` (the
-  core-utils API is synchronous) and behind `APPLY_GUARD`, a
-  `tokio::sync::Mutex` — two concurrent rebuilds would fight over the same git
-  tree. Same shape as `src/command/lifecycle.rs:99-108`.
+  core-utils API is synchronous) and behind `rebuild::guard()`, the lock every
+  configuration transaction of this process takes — two concurrent rebuilds
+  would fight over the same git tree, and the own-interface commands reach that
+  tree too. Each one also takes `shutdown::enter()`, so a mount change arriving
+  during termination is refused instead of started and killed.
 - An options change is a **re-declaration**: `add_mount` resets `.options`
   before writing, so passing the new list is enough. Options are written
   verbatim, in the user's order, not normalised.

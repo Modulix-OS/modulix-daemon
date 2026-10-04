@@ -102,6 +102,15 @@ impl Daemon {
     /// The command's human-readable status string on success.
     ///
     /// # Post-conditions
+    /// Every command runs under two serialising gates taken after the polkit
+    /// check and before [`Command::execute`]: [`crate::shutdown::enter`],
+    /// which refuses to start anything once the daemon is terminating, and
+    /// [`crate::rebuild::guard`], which makes the configuration transactions
+    /// of this process queue instead of racing on the same git repository.
+    /// Both are released when this returns, so a failed command holds
+    /// neither. A second request therefore waits for the first to finish,
+    /// rebuild included - minutes, on the wire.
+    ///
     /// On success, if `name` starts with `"Install"` or `"Uninstall"`, the
     /// `Store1` installed-listing cache is invalidated via
     /// `crate::store::invalidate_installed` so it does not keep serving the
@@ -112,8 +121,8 @@ impl Daemon {
     /// named `Install*`/`Uninstall*`.
     ///
     /// On success of `"UpdateSystem"` specifically, and only when its mode
-    /// actually applied something (`"switch"` or `"boot"` — **not** `"build"`,
-    /// see below): `crate::store`'s outdated-inputs cache is invalidated via
+    /// actually applied something (`"switch"`, `"boot"` or `"apply"` — **not**
+    /// `"build"` or `"stage"`, see below): `crate::store`'s outdated-inputs cache is invalidated via
     /// `crate::store::invalidate_updates` (a completed update should not keep
     /// reporting itself as outdated), the candidate lockfile slot is
     /// emptied via `crate::store::clear_pending_lock` (the command already took it;
@@ -124,17 +133,23 @@ impl Daemon {
     /// which this reuses) since a successful update moves nixpkgs out from
     /// under the index.
     ///
-    /// `UpdateSystem("build")` is exempt from all three: it only warms the nix
-    /// store, so the system is still outdated afterwards (the row must keep
-    /// showing), the candidate must stay pending for the `"switch"`/`"boot"`
-    /// that follows to apply the revisions just built, and nixpkgs has not
+    /// `UpdateSystem("build")` and `UpdateSystem("stage")` are exempt from all
+    /// three: they only resolve and realise a candidate, so the system is
+    /// still outdated afterwards (the row must keep showing), the candidate
+    /// must stay available for the apply that follows, and nixpkgs has not
     /// moved under the index.
+    ///
+    /// A successful `Install*`/`Uninstall*` also kicks off a background
+    /// re-staging ([`crate::staging::spawn_background_stage`]): the install
+    /// moved the configuration on, so the staged pre-build no longer matches
+    /// what a shutdown would activate.
     ///
     /// # Errors
     /// Returns an error, and skips both execution and cache invalidation,
     /// when: the polkit check denies authorization or itself fails (caller
     /// declined the prompt, or the authority call errored); `name` matches
-    /// no registered command ([`zbus::fdo::Error::UnknownMethod`]); or
+    /// no registered command ([`zbus::fdo::Error::UnknownMethod`]); the
+    /// daemon is shutting down ([`crate::error::Error::ShuttingDown`]); or
     /// [`Command::execute`] itself fails (mapped from
     /// [`crate::error::Error`] via `Into`) — this includes the
     /// `modulix-core-utils` call failing, in which case that library is
@@ -155,12 +170,18 @@ impl Daemon {
             .find(|command| command.name() == name)
             .ok_or_else(|| zbus::fdo::Error::UnknownMethod(name.to_string()))?;
 
+        let _in_flight = crate::shutdown::enter()?;
+        let _guard = crate::rebuild::guard().await;
         let result = command.execute(arguments).await;
+
+        let applied_update =
+            name == "UpdateSystem" && !matches!(arguments.first(), Some(&"build") | Some(&"stage"));
 
         if result.is_ok() {
             if name.starts_with("Install") || name.starts_with("Uninstall") {
                 crate::store::invalidate_installed();
-            } else if name == "UpdateSystem" && arguments.first() != Some(&"build") {
+                crate::staging::spawn_background_stage(crate::command::update::background_cores());
+            } else if applied_update {
                 crate::store::invalidate_updates();
                 crate::store::clear_pending_lock();
                 modulix_core_utils::package_index::invalidate_fingerprint();

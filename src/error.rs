@@ -54,6 +54,18 @@ pub enum Error {
     /// is the I/O error's `Display` string.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The daemon received a termination signal and is draining the
+    /// transactions already in flight, so it refused to start a new one.
+    ///
+    /// # Variants
+    /// Carries nothing: there is one reason, and it is not about the request.
+    ///
+    /// Converted to `zbus::fdo::Error::Failed(msg)`, whose wire error name is
+    /// `org.freedesktop.DBus.Error.Failed`. A client that sees it should retry
+    /// once the daemon is back - systemd restarts it (`Restart = "always"`).
+    #[error("daemon is shutting down, no new transaction accepted")]
+    ShuttingDown,
 }
 
 impl From<Error> for zbus::fdo::Error {
@@ -70,11 +82,15 @@ impl From<Error> for zbus::fdo::Error {
     /// - [`Error::Io`] becomes `zbus::fdo::Error::Failed(err.to_string())`
     ///   (wire name `org.freedesktop.DBus.Error.Failed`), message = the I/O
     ///   error's `Display` string.
+    /// - [`Error::ShuttingDown`] becomes `zbus::fdo::Error::Failed(msg)` (wire
+    ///   name `org.freedesktop.DBus.Error.Failed`), message = this variant's
+    ///   `Display` string.
     fn from(err: Error) -> Self {
         match err {
             Error::Zbus(err) => zbus::fdo::Error::ZBus(err),
             Error::CoreUtils(msg) => zbus::fdo::Error::Failed(msg),
             Error::Io(err) => zbus::fdo::Error::Failed(err.to_string()),
+            Error::ShuttingDown => zbus::fdo::Error::Failed(err.to_string()),
         }
     }
 }

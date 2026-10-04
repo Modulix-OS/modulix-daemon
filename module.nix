@@ -32,6 +32,11 @@ in {
       requires       = [ "dbus.service" ];
       wantedBy       = [ "multi-user.target" ];
 
+      restartIfChanged = false;
+      stopIfChanged    = false;
+
+      startLimitIntervalSec = 0;
+
       path = [ pkgs.nix ];
 
       serviceConfig = {
@@ -39,8 +44,10 @@ in {
         BusName         = "org.modulix.Daemon";
         ExecStart       = "${cfg.package}/bin/mx-daemon";
         User            = "root";
-        Restart         = "on-failure";
+        Restart         = "always";
         RestartSec      = "5s";
+        KillMode        = "process";
+        TimeoutStopSec  = "30min";
         SyslogIdentifier = "mx-daemon";
 
         NoNewPrivileges = true;

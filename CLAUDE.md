@@ -111,6 +111,22 @@ the git tree, so an install that happens while an update waits commits with
 candidate (commit without rebuild) only after the new system is built and
 registered as next boot's.
 
+**`cache_dir()` is `/var/cache/modulix-os`, and it must stay outside the
+configuration repository.** It used to be `/etc/modulix-os/.cache`, which broke
+every staged build: `nixos-rebuild --flake` is pointed at the bare path of the
+`.git`-less staged copy, and `nix` resolves a bare path by walking its
+*parents* looking for a git root. That walk reached `/etc/modulix-os/.git`, the
+copy was read as a `git+file://` flake restricted to tracked files, and the
+build died with `Path '.cache/pending-update/config/flake.nix' … is not tracked
+by Git`. Listing the directory in `.git/info/exclude` does not help — excluded
+is still untracked as far as `nix` is concerned. Outside any repository the same
+bare path is read as a `path:` flake, which is what
+`modulix_core_utils::staging` relies on. The directory is created by
+`CacheDirectory = "modulix-os"` on both `modulix-daemon.service` and
+`mx-apply-update.service` (mxpkgs), and `MX_CACHE_DIR` points core-utils at it.
+A machine installed before the move keeps an inert `/etc/modulix-os/.cache`,
+still excluded; `rm -rf` it by hand.
+
 `CheckUpdate`, `StagedUpdate` and `ListStagedInputs` need no polkit action (they
 are `Store1` reads) and no `Command` impl, so `org.modulix.daemon.policy`,
 `org.modulix.Daemon.conf` and `command::registry()` are untouched by them.

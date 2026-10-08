@@ -63,12 +63,16 @@ Genericity via traits so new listened interfaces and new own-interface commands 
 
 Adding work = add a new trait impl (listened interface) or a new interface method + handler (own interface); both funnel into the "info log → dry-run-gated library call" pattern above.
 
-## System updates — staged, applied at shutdown
+## System updates — staged, applied at shutdown or on demand
 
-**A system update is never applied while the machine is in use.** No
-`UpdateSystem` mode switches the running system: the update is resolved and
-pre-built in the background, made the next boot's default, and takes effect on
-restart. The mechanism lives in `modulix_core_utils::staging`; this daemon
+**An automatic update is never applied while the machine is in use; a manual
+one is.** The split is by *who asked*, not by what is possible: a background
+update is only ever resolved and pre-built, and the `nixos-rebuild boot` that
+makes it the next boot's default runs at shutdown, so it takes effect on
+restart — whereas `UpdateSystem("switch")`, the "Update Now" a user clicked,
+activates the pre-built system immediately. No `UpdateSystem` mode writes a
+bootloader entry while the session runs except the explicit administrative
+`"apply"`. The mechanism lives in `modulix_core_utils::staging`; this daemon
 drives it.
 
 - `Store1.CheckUpdate() -> b` (`src/store/mod.rs`) calls
@@ -89,27 +93,74 @@ drives it.
   per-input rows of what the next boot will carry. Pure reads, no probe — this
   is what a "restart to finish updating" prompt reads, since an up-to-date
   system and one waiting for a reboot look identical to `ListOutdatedInputs`.
-- `Daemon.UpdateSystem(mode)` (`src/command/update.rs`), five modes:
+- `Daemon.UpdateSystem(mode)` (`src/command/update.rs`), five modes. The mode
+  table is the pure `fn steps(mode) -> Option<Steps>`, which is *also* the mode
+  validation — there is no second `matches!` to keep in sync:
   - `"build"` / `"stage"` → `staging::stage_update`: resolve + `nixos-rebuild
     build`, nothing applied. Half the cores.
-  - `"boot"` → stage if needed, then `staging::apply_staged`: the pre-built
-    system becomes the next boot's default. The running system is untouched.
-  - `"switch"` → **synonym of `"boot"`**, kept for the clients that still send
-    it. It does not switch; there is no in-use apply at all.
-  - `"apply"` → `apply_staged` only, no staging. Administrative escape hatch;
-    the normal path is the shutdown unit.
+  - `"boot"` → `staging::stage_update` too, and nothing else. The
+    `nixos-rebuild boot` that promotes the staged system is
+    `mx-apply-update.service`'s job at shutdown and is never run from the
+    daemon, so `"boot"` does the same *work* as `"build"` and differs only in
+    its reply — which is what sends GNOME Software's row to
+    `PENDING_INSTALL`. This is the mode the plugin's **unattended** apply job
+    sends; a click sends `"switch"` (see below).
+  - `"switch"` → stage if needed, then `staging::apply_staged_with(…,
+    Activation::Switch)`: `nixos-rebuild switch`, **the running system is
+    replaced**. The manual path, and the only mode that does this. This is what
+    GNOME Software's "Update Now" sends: `update_mode_for_flags()` in
+    `gnome-software-plugin` reads `GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE`,
+    which every click-driven path sets and `gs-update-monitor.c` never does.
+  - `"apply"` → `Activation::Boot` only, no staging. Administrative escape
+    hatch that promotes for the next boot by hand; the normal path is the
+    shutdown unit.
   Dry run short-circuits every mode *including the probe*, returning the mode's
   success message.
-- The apply normally comes from outside the daemon:
+- **The promotion for the next boot only ever happens at shutdown.**
   `mx-apply-update.service` (mxpkgs) runs core-utils' `mx-apply-update` binary
-  before `shutdown.target`.
+  before `shutdown.target`. That binary calls `apply_staged`, which is
+  `apply_staged_with(…, Activation::Boot)` under its own name — the shutdown
+  path cannot pick `Switch` by accident, and no `UpdateSystem` mode but the
+  explicit `"apply"` can pick `Boot`. A machine that loses power instead of
+  shutting down cleanly never runs it: the staged update stays on disk and the
+  next clean shutdown applies it.
+
+`Activation` is a two-variant public enum in `modulix_core_utils::staging`, not
+the crate's internal `BuildCommand`. `BuildCommand` has six variants, four of
+which are meaningless or destructive here (`Install` is
+`nixos-install --root /mnt`), and it is not public anyway — `core-utils`'
+`src/lib.rs` declares `mod core;` privately. Keeping the narrow type makes the
+bad choices unrepresentable instead of rejected at run time.
+
+**Why a `"switch"` does not corrupt the transaction it runs from.**
+`switch-to-configuration` would normally restart a unit whose definition
+changed — here, killing the daemon mid-transaction. Three facts, all verified,
+keep that from happening and should not be re-derived:
+
+- the unit sets `restartIfChanged = false` and `stopIfChanged = false`
+  (mxpkgs `modulixos/modulix-daemon/default.nix`), so the activation leaves it
+  alone;
+- nixpkgs gives `dbus.service` `reloadIfChanged = true`
+  (`nixos/modules/services/system/dbus.nix`, "Don't restart dbus-daemon. Bad
+  things tend to happen if we do."), so the bus is reloaded and the daemon
+  never loses its connection;
+- `polkit` *is* restarted (`restartTriggers = [ config.system.path ]`) and so
+  is `udisks2`, both harmlessly: `src/polkit.rs` builds its `AuthorityProxy`
+  per call, and the UDisks2 listeners' `BecomeMonitor` match rules live on the
+  bus rather than on a connection to `udisksd`, while `Watchers::spawn`
+  deduplicates a live watcher to preserve its baseline.
+
+The consequence to live with: `restartIfChanged = false` means an update
+carrying a new daemon keeps being served by the **old** binary until the next
+boot or an explicit `systemctl restart`. A client must not assume a fresh
+version's methods exist right after a `"switch"`.
 
 **Invariant: the committed `flake.lock` is the one the running system was built
 from.** The staged candidate lives under `cache_dir()/pending-update/`, never in
 the git tree, so an install that happens while an update waits commits with
-`UpdateInput::Keep` and cannot drag the update in. `apply_staged` promotes the
-candidate (commit without rebuild) only after the new system is built and
-registered as next boot's.
+`UpdateInput::Keep` and cannot drag the update in. `apply_staged_with` promotes
+the candidate (commit without rebuild) only after the new system is built and
+either registered as next boot's or activated.
 
 **`cache_dir()` is `/var/cache/modulix-os`, and it must stay outside the
 configuration repository.** It used to be `/etc/modulix-os/.cache`, which broke

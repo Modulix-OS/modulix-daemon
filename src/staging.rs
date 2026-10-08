@@ -9,11 +9,20 @@
 //!
 //! # Who applies a staged update
 //!
-//! Normally nobody here: the unit `mx-apply-update.service` runs
-//! `mx-apply-update` before `shutdown.target`, which is the whole point - the
-//! running system is never switched under a live session. [`apply`] exists for
-//! the explicit `UpdateSystem("apply")` call, which is an administrative
-//! escape hatch, not the normal path.
+//! An automatic update: nobody here. The unit `mx-apply-update.service` runs
+//! `mx-apply-update` before `shutdown.target`, which is the whole point - a
+//! background update never switches the running system under a live session.
+//!
+//! A manual update: [`apply`] with [`Activation::Switch`], reached from
+//! `UpdateSystem("switch")`. A user who asked to update now asked for the new
+//! system now, so that path - and only that path - replaces the closure of a
+//! live session.
+//!
+//! [`apply`] has exactly one other caller, the administrative
+//! `UpdateSystem("apply")` escape hatch, which passes [`Activation::Boot`] and
+//! changes nothing but the next boot. `UpdateSystem("boot")` notably does
+//! **not** reach it: it stages and leaves the promotion to the shutdown unit,
+//! so no mode of this daemon writes a bootloader entry while the session runs.
 //!
 //! # Locking
 //!
@@ -22,7 +31,7 @@
 //! reentrant. [`spawn_background_stage`] does not go through `Daemon::run`, so
 //! it takes the guard - and [`crate::shutdown::enter`] - itself.
 
-use modulix_core_utils::staging::{self, StagedUpdate};
+use modulix_core_utils::staging::{self, Activation, StagedUpdate};
 
 use crate::error::Error;
 
@@ -79,20 +88,25 @@ pub async fn stage(cores: Option<u32>) -> Result<Option<StagedUpdate>, Error> {
     .map_err(|err| Error::CoreUtils(err.to_string()))
 }
 
-/// Makes the staged update the next boot's system.
+/// Applies the staged update, activating it the way `activation` asks.
 ///
 /// # Parameters
 /// * `cores` - caps the activation's residual build; `None` leaves the Nix
 ///   default. A staged update is already built, so there is normally nothing
 ///   left to compile.
+/// * `activation` - [`Activation::Boot`] to make the staged system the next
+///   boot's default, [`Activation::Switch`] to activate it at once. Only a
+///   user-initiated update may pass `Switch`; see the module docs.
 ///
 /// # Pre-conditions
 /// The caller must already hold [`crate::rebuild::guard`].
 ///
 /// # Post-conditions
-/// The running system is **not** switched: the new system becomes the next
-/// boot's default and the candidate lockfile is committed. Skipped - only
-/// logged - under [`crate::dry_run::is_dry_run`], reporting `false`.
+/// The candidate lockfile is committed either way. With [`Activation::Boot`]
+/// the running system is **not** switched: the new system only becomes the
+/// next boot's default. With [`Activation::Switch`] the running system has
+/// already been replaced when this returns. Skipped - only logged - under
+/// [`crate::dry_run::is_dry_run`], reporting `false`.
 ///
 /// # Returns
 /// `true` when a staged update was applied, `false` when there was nothing
@@ -100,17 +114,17 @@ pub async fn stage(cores: Option<u32>) -> Result<Option<StagedUpdate>, Error> {
 ///
 /// # Errors
 /// [`Error::CoreUtils`] wrapping whatever
-/// [`modulix_core_utils::staging::apply_staged`] reports, or a cancelled
+/// [`modulix_core_utils::staging::apply_staged_with`] reports, or a cancelled
 /// blocking task.
-pub async fn apply(cores: Option<u32>) -> Result<bool, Error> {
-    tracing::info!(?cores, "applying the staged system update for next boot");
+pub async fn apply(cores: Option<u32>, activation: Activation) -> Result<bool, Error> {
+    tracing::info!(?cores, ?activation, "applying the staged system update");
 
     if crate::dry_run::is_dry_run() {
         return Ok(false);
     }
 
     tokio::task::spawn_blocking(move || {
-        staging::apply_staged(crate::config_dir::config_dir(), cores)
+        staging::apply_staged_with(crate::config_dir::config_dir(), cores, activation)
     })
     .await
     .map_err(|err| Error::CoreUtils(err.to_string()))?

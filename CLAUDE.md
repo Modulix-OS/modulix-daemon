@@ -178,9 +178,28 @@ bare path is read as a `path:` flake, which is what
 A machine installed before the move keeps an inert `/etc/modulix-os/.cache`,
 still excluded; `rm -rf` it by hand.
 
-`CheckUpdate`, `StagedUpdate` and `ListStagedInputs` need no polkit action (they
-are `Store1` reads) and no `Command` impl, so `org.modulix.daemon.policy`,
-`org.modulix.Daemon.conf` and `command::registry()` are untouched by them.
+`CheckUpdate`, `StagedUpdate`, `ListStagedInputs` and `RebootRequired` need no
+polkit action (they are `Store1` reads) and no `Command` impl, so
+`org.modulix.daemon.policy`, `org.modulix.Daemon.conf` and
+`command::registry()` are untouched by them.
+
+**`Store1.RebootRequired() -> (bas)` (`src/store/mod.rs`) is how a client tells
+"updated" from "updated, restart to finish" after a `"switch"`.** A
+`nixos-rebuild switch` cannot replace the kernel, the kernel modules or the
+initrd the machine is *running*, so a successful switch may still owe a reboot —
+or may not, if it moved only userspace. `modulix_core_utils::reboot` settles it
+exactly, by comparing `/run/booted-system` with `/run/current-system` on those
+three entries; there is no list of "reboot-worthy" package names to maintain and
+so no driver it can miss. `systemd` is deliberately not among them:
+`switch-to-configuration` re-executes it in place. The second member of the
+reply is `nix store diff-closures` between the two closures — the same tool
+`mx-latest-update` uses, but between booted and current rather than between the
+last two profile generations, because "what changed since boot" is the question
+a reboot prompt answers. That list is **informational only**: it is empty when
+the diff could not be run, and the boolean never depends on it. The result is
+memoised on what `/run/current-system` points at, so the `nix` subprocess runs
+at most once per activation — the one reason this `Store1` method is not a pure
+read like the others.
 
 ## Crash safety (`src/shutdown.rs`, `src/rebuild.rs`)
 

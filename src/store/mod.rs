@@ -1244,6 +1244,46 @@ impl Store {
             .map(InputEntry::into_dict)
             .collect())
     }
+
+    /// Serves `RebootRequired() -> (bas)`: whether the running system still
+    /// needs a reboot, and what moved since it booted.
+    ///
+    /// A `nixos-rebuild switch` - what
+    /// [`UpdateSystem("switch")`](crate::command::update) does - replaces the
+    /// system closure under the live session, but not the kernel, kernel
+    /// modules or initrd the machine is *running*. This call is how a client
+    /// tells "updated, nothing left to do" from "updated, restart to pick up
+    /// the new kernel" after such a switch. It answers for the running system,
+    /// not for an update: a machine that was switched and never rebooted keeps
+    /// reporting `true` however long ago that was.
+    ///
+    /// # Returns
+    /// `(required, changed)`:
+    /// * `required` - the running kernel, kernel modules or initrd differ from
+    ///   what the current system closure declares. Exact: it compares
+    ///   `/run/booted-system` with `/run/current-system` rather than guessing
+    ///   from package names.
+    /// * `changed` - one entry per line of `nix store diff-closures` between
+    ///   those two closures, e.g. `linux: 6.6.1 -> 6.6.2`. Informational, and
+    ///   **empty when the diff could not be run** - never infer `required`
+    ///   from it.
+    ///
+    /// # Post-conditions
+    /// Writes nothing. Unlike [`staged_update`](Store::staged_update) it is
+    /// not a pure read: the first call after an activation spawns
+    /// `nix store diff-closures`. The result is memoised on what
+    /// `/run/current-system` points at, so every later call until the next
+    /// switch is free - but a client should still treat the first one as
+    /// costing a subprocess and not poll it tightly.
+    ///
+    /// # Errors
+    /// Never returns `Err`: a system without `/run/booted-system` or without
+    /// `nix` on `PATH` reports `(false, [])`, which is what a caller would do
+    /// with the error anyway.
+    async fn reboot_required(&self) -> zbus::fdo::Result<(bool, Vec<String>)> {
+        let status = modulix_core_utils::reboot::reboot_status().await;
+        Ok((status.required, status.changed))
+    }
 }
 
 /// Diffs the configuration's current `flake.lock` against a candidate one,

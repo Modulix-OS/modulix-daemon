@@ -13,7 +13,7 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, modulix-core-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
@@ -59,10 +59,25 @@
         mx-daemon-debug = mkMxDaemon { release = false; };
         mx-daemon-test = mkMxDaemon { release = false; test = true; };
 
+        push-cache = import ./nix/attic-push.nix {
+          inherit pkgs;
+          attrs = [ "mx-daemon" ];
+          flakeRef = "path:${self}";
+          tokenFile =
+            if builtins.pathExists ./secrets/attic-token.age
+            then ./secrets/attic-token.age
+            else null;
+        };
+
       in {
         packages = {
-          inherit mx-daemon mx-daemon-debug mx-daemon-test;
+          inherit mx-daemon mx-daemon-debug mx-daemon-test push-cache;
           default = mx-daemon;
+        };
+
+        apps.push-cache = {
+          type = "app";
+          program = "${push-cache}/bin/mx-push-cache";
         };
 
         devShells.default = pkgs.mkShell {

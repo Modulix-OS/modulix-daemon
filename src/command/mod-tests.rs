@@ -13,6 +13,7 @@ fn registry_contains_package_commands() {
             "InstallPlugin",
             "UninstallPlugin",
             "UpdateSystem",
+            "UpdateHardware",
         ]
     );
 }

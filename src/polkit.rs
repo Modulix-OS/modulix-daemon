@@ -68,6 +68,16 @@ pub const ACTION_REMOVE: &str = "org.modulix.daemon.remove";
 /// cost and advancing every flake input, without an admin confirmation).
 pub const ACTION_UPDATE: &str = "org.modulix.daemon.update";
 
+/// polkit action id for `UpdateHardware`.
+///
+/// Matches the `id` attribute of its `<action>` in
+/// `org.modulix.daemon.policy`, which — like [`ACTION_INSTALL`]/
+/// [`ACTION_REMOVE`] and unlike [`ACTION_UPDATE`] — requires an active
+/// session and an `auth_admin` prompt: re-detecting the hardware rewrites
+/// `hardware.nix` and activates the result, so it is an administrative
+/// change and never happens unattended.
+pub const ACTION_HARDWARE: &str = "org.modulix.daemon.hardware";
+
 /// Checks that the caller identified by `header` is authorized for
 /// `action_id`, prompting for authentication (polkit agent) if needed.
 ///

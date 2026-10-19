@@ -36,7 +36,7 @@
 
 use crate::command::setting::{Setting, apply_list, apply_option};
 use crate::command::{self, Command};
-use crate::polkit::{self, ACTION_INSTALL, ACTION_REMOVE, ACTION_UPDATE};
+use crate::polkit::{self, ACTION_HARDWARE, ACTION_INSTALL, ACTION_REMOVE, ACTION_UPDATE};
 
 /// Well-known bus name the daemon owns on the system bus.
 ///
@@ -550,6 +550,56 @@ impl Daemon {
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> zbus::fdo::Result<String> {
         self.run(connection, &header, ACTION_UPDATE, "UpdateSystem", &[mode])
+            .await
+    }
+
+    /// Re-detects the machine's hardware and rebuilds the system with it.
+    ///
+    /// D-Bus signature: `UpdateHardware() -> (s)`.
+    ///
+    /// Takes no argument: the topology is read from the machine, not from the
+    /// caller. The handler is `crate::command::hardware`, which delegates to
+    /// `modulix_core_utils::hardware_config::redetect_hardware_options`.
+    ///
+    /// # Pre-conditions
+    /// The caller must be authorized for the [`ACTION_HARDWARE`] polkit
+    /// action. Like [`ACTION_INSTALL`]/[`ACTION_REMOVE`] and unlike
+    /// [`ACTION_UPDATE`], the policy requires an active session **and** an
+    /// `auth_admin` prompt, so this never completes unattended.
+    ///
+    /// # Returns
+    /// `"hardware configuration updated"`, once the rebuild has completed.
+    /// The same string is returned when the detected topology already matches
+    /// `hardware.nix` and nothing was rebuilt: `modulix-core-utils` reports no
+    /// distinction. A client that needs to know whether anything changed must
+    /// read `Store1.RebootRequired` or the configuration itself.
+    ///
+    /// # Post-conditions
+    /// On success the detected `mx.hardware.*` options are part of the active
+    /// generation — this method replaces the running system, like
+    /// `UpdateSystem("switch")`, and like it does not restart this daemon. The
+    /// committed `flake.lock` is left untouched, so a staged system update is
+    /// not dragged in. Only the options the detection owns are rewritten; a
+    /// user's `nvidia.disable`, acceleration and compute settings survive.
+    ///
+    /// The call blocks for the whole `nixos-rebuild switch` — potentially
+    /// **minutes**. Everything is skipped, and the status string returned
+    /// anyway, when [`crate::dry_run::is_dry_run`] is true (the default in
+    /// debug builds). No cache is invalidated: neither the installed-package
+    /// list nor the staging area changes.
+    ///
+    /// # Errors
+    /// A D-Bus error reply is returned, and no rebuild is attempted, if the
+    /// caller declines or is otherwise denied polkit authorization. A D-Bus
+    /// error reply is also returned if the detection or the underlying
+    /// `modulix-core-utils` transaction fails, in which case the configuration
+    /// is left unchanged.
+    async fn update_hardware(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        self.run(connection, &header, ACTION_HARDWARE, "UpdateHardware", &[])
             .await
     }
 

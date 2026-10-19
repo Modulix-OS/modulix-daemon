@@ -201,6 +201,42 @@ memoised on what `/run/current-system` points at, so the `nix` subprocess runs
 at most once per activation — the one reason this `Store1` method is not a pure
 read like the others.
 
+## Hardware re-detection (`UpdateHardware`)
+
+`Daemon.UpdateHardware()` (`src/command/hardware.rs`) calls
+`modulix_core_utils::hardware_config::redetect_hardware_options`, which probes
+the **live** machine (GPU slots from sysfs, laptop chassis, fingerprint reader)
+and writes the `mx.hardware.*` options into `hardware.nix`. It takes no
+argument: there is nothing to name, the hardware is whatever is plugged in.
+
+- **Its own polkit action, `auth_admin`.** `polkit::ACTION_HARDWARE`
+  (`org.modulix.daemon.hardware`) sits with `ACTION_INSTALL`/`ACTION_REMOVE`,
+  not with `ACTION_UPDATE`: the latter is deliberately `allow_active=yes` so a
+  background update completes unattended, which is exactly what rewriting
+  `hardware.nix` and activating the result must *not* do.
+- **Shape is `filesystem::add_mount`'s, not `UpdateSystem`'s.**
+  `redetect_hardware_options` is a synchronous `make_transaction(…,
+  BuildCommand::Switch, UpdateInput::Keep, …)`, so the handler wraps it in
+  `tokio::task::spawn_blocking` (the `src/command/lifecycle.rs` pattern) and
+  relies on `Daemon::run` for `shutdown::enter` and `rebuild::guard`. It
+  replaces the running system like `UpdateSystem("switch")` — and like it does
+  not restart the daemon — while `UpdateInput::Keep` keeps a staged update out.
+- **No "something changed" signal.** The detection is idempotent and a
+  topology identical to the file produces no commit and no rebuild, but
+  core-utils returns `Ok(())` either way, so the reply is
+  `"hardware configuration updated"` in both cases. A client that needs the
+  distinction reads `Store1.RebootRequired`. Nothing is invalidated in
+  `Daemon::run`: neither the installed-package list nor the staging area
+  changes.
+- `hardware-config` must stay in the `modulix-core-utils` feature list in
+  `Cargo.toml` — it gates the whole module, and it pulls `regex` into
+  `Cargo.lock`, which `flake.nix` consumes via `cargoLock.lockFile`.
+- The detection writes only what it owns (`laptop`, `has_fingerprint`, the five
+  options per GPU slot, the three `nvidia.*BusId`); a user's `nvidia.disable`,
+  acceleration and compute settings survive. `lspci` on `PATH` is what names
+  each GPU's generation — without it an old NVIDIA card gets the current driver
+  branch instead of its legacy one.
+
 ## Crash safety (`src/shutdown.rs`, `src/rebuild.rs`)
 
 A configuration transaction is not interruptible: core-utils implements no

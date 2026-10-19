@@ -58,4 +58,21 @@
     </defaults>
   </action>
 
+  <action id="org.modulix.daemon.hardware">
+    <description>Re-detect the hardware and rebuild the system</description>
+    <description
+            xml:lang="fr"
+        >Re-détecter le matériel et reconstruire le système</description>
+    <message>Authentication is required to re-detect the hardware.</message>
+    <message
+            xml:lang="fr"
+        >Une authentification est requise pour re-détecter le matériel.</message>
+
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+
 </policyconfig>

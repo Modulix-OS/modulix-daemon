@@ -4,6 +4,7 @@
 //! implementation; [`registry`] lists every implementation that should be
 //! wired up on [`crate::daemon::Daemon`].
 
+mod hardware;
 mod lifecycle;
 mod module;
 mod package;
@@ -14,6 +15,7 @@ pub(crate) mod update;
 use async_trait::async_trait;
 
 use crate::error::Error;
+use hardware::UpdateHardware;
 use module::{InstallModule, UninstallModule};
 use package::{InstallPackage, UninstallPackage};
 use plugin::{InstallPlugin, UninstallPlugin};
@@ -67,9 +69,10 @@ pub trait Command: Send + Sync {
 /// One boxed [`Command`] per implementation currently wired up:
 /// `package::InstallPackage`/`package::UninstallPackage`,
 /// `module::InstallModule`/`module::UninstallModule`,
-/// `plugin::InstallPlugin`/`plugin::UninstallPlugin`, and
-/// `update::UpdateSystem`. Consumed by [`crate::daemon::Daemon::new`] to
-/// populate [`crate::daemon::Daemon`]'s command table.
+/// `plugin::InstallPlugin`/`plugin::UninstallPlugin`,
+/// `update::UpdateSystem` and `hardware::UpdateHardware`. Consumed by
+/// [`crate::daemon::Daemon::new`] to populate [`crate::daemon::Daemon`]'s
+/// command table.
 pub fn registry() -> Vec<Box<dyn Command>> {
     vec![
         Box::new(InstallPackage),
@@ -79,6 +82,7 @@ pub fn registry() -> Vec<Box<dyn Command>> {
         Box::new(InstallPlugin),
         Box::new(UninstallPlugin),
         Box::new(UpdateSystem),
+        Box::new(UpdateHardware),
     ]
 }
 

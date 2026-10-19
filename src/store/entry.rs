@@ -483,7 +483,11 @@ pub fn icon_name_for_app_id(app_id: &str) -> Option<&'static str> {
 /// An [`AppEntry`] with `name`/`base_name` = `module.package_name()`;
 /// `pname` = the Flatpak/AppStream name for `module.id()` when known (via
 /// [`app_name_for_app_id`]), else `module.display_name()`; `app_id` =
-/// `module.id()`; `group_id` = `app_id` (modules never group by pname);
+/// `module.id()`, i.e. the module's Flathub id and nothing else — it keys the
+/// plugin's icon cache and the Flathub enrichment, so a module Flathub does
+/// not carry leaves it empty; `group_id` = `module.group_key()`, which falls
+/// back to the `pname` of the nix package the module wraps, so a
+/// Flathub-less module and that package collapse to one row instead of two;
 /// `version` empty; `icon`/`icon_name` from `module`; `kind` `"module"`;
 /// `flatpak_preferred` always `false`; `variant_rank` always `0`;
 /// `installed` always `false` (stamped later by the caller).
@@ -491,7 +495,7 @@ pub fn icon_name_for_app_id(app_id: &str) -> Option<&'static str> {
 /// # Pre-conditions
 /// `module.resolve()` must have run beforehand, or `module.icon()` will be
 /// unpopulated and the entry's `icon` field will be `None`.
-pub fn module_entry(module: &ModuleInfo, score: u32) -> AppEntry {
+pub async fn module_entry(module: &ModuleInfo, score: u32) -> AppEntry {
     let app_id = module.id().map(str::to_string);
     let pname = app_id
         .as_deref()
@@ -505,7 +509,7 @@ pub fn module_entry(module: &ModuleInfo, score: u32) -> AppEntry {
         app_name: None,
         summary: module.summary().to_string(),
         version: String::new(),
-        group_id: app_id.clone(),
+        group_id: module.group_key().await,
         app_id,
         icon: module.icon().map(str::to_string),
         icon_name: module.icon_name().map(str::to_string),
@@ -749,38 +753,41 @@ pub fn icon_base_name(attr: &str) -> Option<String> {
     (base != attr).then(|| base.to_string())
 }
 
-/// The Modulix module row(s) targeting `app_id`, best-effort and bounded by
+/// The Modulix module row(s) grouping with `gid`, best-effort and bounded by
 /// `timeout` (timeout/error → no row, never an error to the caller). Does not
 /// call `resolve()`: the popover row only needs the packaging format, not an
 /// icon or description.
 ///
 /// # Parameters
-/// * `app_id` - the AppStream id to find module rows for.
+/// * `gid` - the grouping key to find module rows for: an AppStream id, or
+///   the `pname` of a nix package a Flathub-less module wraps.
 /// * `timeout` - upper bound on how long to wait for
-///   [`module_info::modules_for_app_id`].
+///   [`module_info::modules_for_group_id`].
 ///
 /// # Returns
-/// One [`AppEntry`] (`kind: "module"`) per module targeting `app_id`, each
-/// with `pname` = the shared Flatpak/AppStream name for `app_id` when known
+/// One [`AppEntry`] (`kind: "module"`) per module grouping with `gid`, each
+/// with `pname` = the shared Flatpak/AppStream name for `gid` when known
 /// (via [`app_name_for_app_id`]) else the module's own display name — looked
-/// up once for all modules, since every module here targets the same
-/// `app_id` (that's how they were filtered) and so shares the same name;
-/// `app_id`/`group_id` both set to `app_id`; `icon` always `None` (no
-/// `resolve()` call); `version` empty; `score` `0`; `variant_rank` `0`;
+/// up once for all modules, since every module here shares `gid` (that's how
+/// they were filtered) and so shares the same name; `group_id` set to `gid`
+/// and `app_id` to the module's own Flathub id, which is `None` for a module
+/// grouped by `pname` (a bare `pname` is no AppStream id, and `app_id` keys
+/// the plugin's icon cache and the Flathub enrichment); `icon` always `None`
+/// (no `resolve()` call); `version` empty; `score` `0`; `variant_rank` `0`;
 /// `flatpak_preferred` `false`; `installed` `false`. An empty `Vec` on
 /// timeout or lookup error — never propagated as an error to the caller.
 ///
 /// # Errors
 /// Never returns an error; a timeout or an `Err` from
-/// [`module_info::modules_for_app_id`] both collapse to an empty result.
-pub async fn module_rows_for_app_id(app_id: &str, timeout: std::time::Duration) -> Vec<AppEntry> {
-    let modules = tokio::time::timeout(timeout, module_info::modules_for_app_id(app_id))
+/// [`module_info::modules_for_group_id`] both collapse to an empty result.
+pub async fn module_rows_for_group_id(gid: &str, timeout: std::time::Duration) -> Vec<AppEntry> {
+    let modules = tokio::time::timeout(timeout, module_info::modules_for_group_id(gid))
         .await
         .ok()
         .and_then(Result::ok)
         .unwrap_or_default();
 
-    let flatpak_name = app_name_for_app_id(app_id);
+    let flatpak_name = app_name_for_app_id(gid);
 
     modules
         .iter()
@@ -793,8 +800,8 @@ pub async fn module_rows_for_app_id(app_id: &str, timeout: std::time::Duration) 
             app_name: None,
             summary: module.summary().to_string(),
             version: String::new(),
-            app_id: Some(app_id.to_string()),
-            group_id: Some(app_id.to_string()),
+            app_id: module.flathub_id().map(str::to_string),
+            group_id: Some(gid.to_string()),
             icon: None,
             icon_name: module.icon_name().map(str::to_string),
             kind: "module",

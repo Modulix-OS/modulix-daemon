@@ -24,7 +24,7 @@ use crate::cache::FlightCache;
 use entry::{
     AppEntry, Dict, EnrichEntry, InputEntry, PluginEntry, alt_sort_key, base_attr,
     collect_screenshots, dedup_by_group, icon_base_name, icon_name_for_app_id, module_entry,
-    module_rows_for_app_id, package_entry, variant_label, variant_rank,
+    module_rows_for_group_id, package_entry, variant_label, variant_rank,
 };
 
 /// Cap shared by every cache in this module: one entry per distinct query/
@@ -662,7 +662,9 @@ impl Store {
     /// # Returns
     /// One row per matching module (see `entry::AppEntry`), best match
     /// first. Unlike `search_packages`, results are not deduplicated by
-    /// group — modules only ever group by their own app-id, if any. A query
+    /// group — a module groups by its own key alone (its Flathub id, else the
+    /// nix package it wraps, see `ModuleInfo::group_key`), so two modules
+    /// never collide. A query
     /// matching nothing yields an empty array, never an error.
     ///
     /// # Errors
@@ -682,10 +684,10 @@ impl Store {
                 stream::iter(&scored)
                     .for_each_concurrent(CONCURRENCY_LIMIT, |(_, module)| module.resolve())
                     .await;
-                scored
-                    .iter()
-                    .map(|(score, module)| module_entry(module, *score))
+                stream::iter(&scored)
+                    .then(|(score, module)| module_entry(module, *score))
                     .collect()
+                    .await
             })
             .await;
         stamp_installed(&mut entries).await;
@@ -758,13 +760,15 @@ impl Store {
             "list_installed_modules",
         )?;
         resolve_all(&modules).await;
-        let entries: Vec<AppEntry> = modules
-            .iter()
-            .map(|m| AppEntry {
-                installed: true,
-                ..module_entry(m, 0)
+        let entries: Vec<AppEntry> = stream::iter(&modules)
+            .then(|m| async move {
+                AppEntry {
+                    installed: true,
+                    ..module_entry(m, 0).await
+                }
             })
-            .collect();
+            .collect()
+            .await;
         Ok(entries.into_iter().map(AppEntry::into_dict).collect())
     }
 
@@ -1349,8 +1353,9 @@ async fn fetch_enrichment(app_id: &str) -> Option<EnrichEntry> {
 /// All installable variants of a group, for the `alternate-of` query. The
 /// argument is the grouping key, i.e. [`AppEntry::group_id`]:
 ///
-/// - a Modulix module targeting this app-id, if any, always comes first
-///   ([`module_rows_for_app_id`]);
+/// - a Modulix module sharing this grouping key — its Flathub id, or the
+///   `pname` of the nix package it wraps — if any, always comes first
+///   ([`module_rows_for_group_id`]);
 /// - **app-id group** (in the curated table): the nix attributes mapped to
 ///   that AppStream id (`firefox`, `firefox-bin`, …) — cheap table lookup;
 /// - **pname group** (no AppStream id, e.g. `nvtop`): a live `nix search` for
@@ -1377,7 +1382,7 @@ async fn fetch_enrichment(app_id: &str) -> Option<EnrichEntry> {
 /// ([`MAX_VARIANT_SEARCH`] cap) degrades to no pname-group rows, via
 /// `unwrap_or_default`.
 async fn build_alt_entries(gid: String, table_attrs: &'static [&'static str]) -> Vec<AppEntry> {
-    let mut entries = module_rows_for_app_id(&gid, MODULE_LOOKUP_TIMEOUT).await;
+    let mut entries = module_rows_for_group_id(&gid, MODULE_LOOKUP_TIMEOUT).await;
 
     if !table_attrs.is_empty() {
         let flatpak_preferred = package_info::is_flatpak_preferred(&gid);

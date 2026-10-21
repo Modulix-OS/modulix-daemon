@@ -8,7 +8,7 @@
 
     modulix-core-utils = {
       url = "github:Modulix-OS/modulix-core-utils";
-      flake = false;
+      inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
@@ -26,7 +26,7 @@
 
         postUnpack = ''
           cp -r --no-preserve=mode,ownership \
-            ${modulix-core-utils} "$NIX_BUILD_TOP/modulix-core-utils"
+            ${modulix-core-utils.outPath} "$NIX_BUILD_TOP/modulix-core-utils"
         '';
 
         postInstall = ''

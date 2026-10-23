@@ -238,14 +238,18 @@ fn license_cache() -> &'static FlightCache<String, Option<String>> {
 /// What the system configuration currently declares: nixpkgs attributes in
 /// `environment.systemPackages`, and enabled `mx.*` modules.
 ///
-/// Both listings are pure parsing of the config files — no `nix eval`, no
-/// network — which is what makes it affordable to consult them on the search
-/// path (see [`installed_sets`]).
+/// Both listings are pure parsing of the config files — no `nix eval`, and
+/// no network beyond the already-memoized module index — which is what makes
+/// it affordable to consult them on the search path (see
+/// [`installed_sets`]).
 ///
 /// # Fields
 /// * `packages` - nixpkgs attribute names listed in
 ///   `environment.systemPackages`.
-/// * `modules` - keys of the `mx.*` modules currently enabled.
+/// * `modules` - keys of the `mx.*` modules currently enabled, plus the
+///   packs whose listed modules they fully cover (a pack is never
+///   declared in `module.nix`; see
+///   `modulix_core_utils::install_module::list_enabled_module_names_with_packs`).
 #[derive(Default)]
 struct InstalledSets {
     packages: HashSet<String>,
@@ -302,10 +306,12 @@ fn update_cache() -> &'static FlightCache<(), Arc<Vec<InputEntry>>> {
 /// # Returns
 /// The current [`InstalledSets`], served from [`installed_cache`] when
 /// fresh; on a cache miss, re-parses `environment.systemPackages` and the
-/// enabled `mx.*` modules from the on-disk configuration (pure file
-/// parsing — no `nix eval`, no network, per [`InstalledSets`]'s own doc).
-/// Either sub-listing that fails to parse is logged at `warn` and treated
-/// as empty, never propagated: a partial or unreadable configuration must
+/// enabled `mx.*` modules from the on-disk configuration (file parsing
+/// only — no `nix eval`, per [`InstalledSets`]'s own doc; the module
+/// listing additionally reads the memoized module index to add back the
+/// meta-modules the configuration covers but never declares). Either
+/// sub-listing that fails to parse is logged at `warn` and treated as
+/// empty, never propagated: a partial or unreadable configuration must
 /// still let the rest of the store answer.
 async fn installed_sets() -> Arc<InstalledSets> {
     installed_cache()
@@ -322,16 +328,10 @@ async fn installed_sets() -> Arc<InstalledSets> {
                     .ok()
             })
             .unwrap_or_default();
-            let modules =
-                tokio::task::spawn_blocking(move || install_module::list_enabled_module_names(dir))
-                    .await
-                    .map_err(|e| tracing::warn!(error = %e, "installed_sets: modules: join"))
-                    .ok()
-                    .and_then(|r| {
-                        r.map_err(|e| tracing::warn!(error = %e, "installed_sets: modules"))
-                            .ok()
-                    })
-                    .unwrap_or_default();
+            let modules = install_module::list_enabled_module_names_with_packs(dir)
+                .await
+                .map_err(|e| tracing::warn!(error = %e, "installed_sets: modules"))
+                .unwrap_or_default();
             Arc::new(InstalledSets {
                 packages: packages.into_iter().collect(),
                 modules: modules.into_iter().collect(),

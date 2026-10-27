@@ -77,7 +77,7 @@ impl Command for UpdateHardware {
 
         if !crate::dry_run::is_dry_run() {
             tokio::task::spawn_blocking(|| {
-                modulix_core_utils::hardware_config::redetect_hardware_options(
+                modulix_core_utils::hardware_config::redetect_all_hardware(
                     crate::config_dir::config_dir(),
                 )
             })

@@ -25,6 +25,22 @@ This is a Nix flake. Do **not** build outside the flake env (needs `pkg-config` 
   - `cargo test` — all tests; `cargo test <name>` — single test.
   - `cargo clippy -- -D warnings` and `cargo fmt` are mandatory before commit (global rule).
 
+### `modulix-core-utils` comes from GitHub, pinned by tag
+
+`Cargo.toml` depends on `git = "https://github.com/Modulix-OS/modulix-core-utils", tag = "v1.0.3"`, not on a sibling `path`. The old path dependency only worked because `flake.nix` copied the flake input into `$NIX_BUILD_TOP/modulix-core-utils` from `postUnpack`; that hack is gone, and `Cargo.lock` is now the single source of truth for the compiled rev.
+
+**Two pins, one hand-edited number, no silent drift.** The crate is pinned by `Cargo.lock` (what the daemon compiles against) *and* by the flake input (whose packages `module.nix` takes `mx-apply-update` and `mx-init` from — that is why the input survived the move). A flake input url cannot read a file, so the tag string genuinely has to be written twice: in `Cargo.toml` and in `flake.nix`. Everything else is derived, and a disagreement is an eval error.
+
+- `flake.nix`'s `coreUtils` binding parses `Cargo.lock` with `builtins.fromTOML`, pulls the rev out of the `git+…#<rev>` source, and compares it with `modulix-core-utils.rev`. Mismatch → `throw` naming both revs and the two commands to run. A lock whose `source` line was eaten by a local `[patch]` throws its own message instead.
+- `cargoLock.outputHashes` is keyed `"modulix-core-utils-${coreUtils.version}"` with `coreUtils.narHash`, i.e. the crate version from `Cargo.lock` and the input's `narHash` from `flake.lock`. Nothing to recompute by hand on a bump: a `github:` input's `narHash` is the NAR of the unpacked tree, which is exactly what `rustPlatform`'s `fetchgit` of the same rev produces (verified on v1.0.2 and v1.0.3). It would only diverge if the repo gained submodules, and then the hash-mismatch error prints the right value.
+- Bumping core-utils is therefore: edit the tag in `Cargo.toml` and in `flake.nix`, then `cargo update -p modulix-core-utils` and `nix flake update modulix-core-utils`. Forget either command and `nix build` refuses to start.
+- **Local development against a sibling checkout** uses `.cargo/config.toml` (gitignored via `/.cargo/`):
+  ```toml
+  [patch."https://github.com/Modulix-OS/modulix-core-utils"]
+  modulix-core-utils = { path = "../modulix-core-utils" }
+  ```
+  `nix build` is unaffected (`src = ./.` on a git flake does not see gitignored files). **The trap:** any `cargo` command run with the patch active rewrites `Cargo.lock` — it drops the `source` line *and* pulls in the sibling checkout's uncommitted dependency bumps (that is how `phf`/`rnix`/`rowan` versions the tag does not require can appear). Committing the lock in that state breaks `nix build`, which has no git source left to fetch. Before every commit, `git diff Cargo.lock` must show the `source = "git+…"` line and nothing else; otherwise move `.cargo/` aside, `git checkout Cargo.lock`, re-insert that one line, and confirm with `cargo metadata --locked`.
+
 NixOS integration: `flake.nix` exposes `nixosModules.mx-daemon`; enable via `services.mx.daemon.enable = true`. `postInstall` installs `org.modulix.Daemon.conf` (dbus policy) and `org.modulix.daemon.policy` (polkit) — these files must exist at repo root for the build to succeed.
 
 ## Project-specific conventions

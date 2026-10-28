@@ -1,6 +1,6 @@
 [package]
 name = "modulix-daemon"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 
 [[bin]]
@@ -11,9 +11,8 @@ path = "src/main.rs"
 async-trait = "0.1"
 futures = "0.3.34"
 futures-util = "0.3"
-# Install/uninstall (module, package, plugin) and every read (search, listings,
-# enrichment) are delegated to core-utils; see src/command and src/store.
-modulix-core-utils = { path = "../modulix-core-utils", features = [
+
+modulix-core-utils = { git = "https://github.com/Modulix-OS/modulix-core-utils", tag = "v1.0.3", features = [
     "package-info",
     "app-info-gui",
     "module-info",

@@ -26,3 +26,6 @@ rustc-ice-*.txt
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 /result-release
+
+# Local cargo override (patch core-utils git dep to a sibling checkout)
+/.cargo/

@@ -7,7 +7,7 @@
     flake-utils.url = "github:numtide/flake-utils";
 
     modulix-core-utils = {
-      url = "github:Modulix-OS/modulix-core-utils/v1.0.2";
+      url = "github:Modulix-OS/modulix-core-utils/v1.0.3";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -24,10 +24,25 @@
         ];
         buildInputs       = [ pkgs.dbus pkgs.openssl ];
 
-        postUnpack = ''
-          cp -r --no-preserve=mode,ownership \
-            ${modulix-core-utils.outPath} "$NIX_BUILD_TOP/modulix-core-utils"
-        '';
+        coreUtils =
+          let
+            lock = fromTOML (builtins.readFile ./Cargo.lock);
+            pkg = builtins.head
+              (builtins.filter (p: p.name == "modulix-core-utils") lock.package);
+            source = pkg.source or (throw
+              "Cargo.lock has no source for modulix-core-utils: a local [patch] to a sibling path leaked into it. Restore the git source line.");
+            rev = builtins.elemAt (builtins.split "#" source) 2;
+          in
+          if rev == modulix-core-utils.rev then {
+            inherit (pkg) version;
+            narHash = modulix-core-utils.narHash;
+          } else throw ''
+            modulix-core-utils pin mismatch:
+              Cargo.lock: ${rev}
+              flake.lock: ${modulix-core-utils.rev}
+            Bump the tag in both Cargo.toml and flake.nix, then run
+            `cargo update -p modulix-core-utils` and `nix flake update modulix-core-utils`.
+          '';
 
         postInstall = ''
             install -Dm644 org.modulix.Daemon.conf \
@@ -41,8 +56,13 @@
           pname = if test then "mx-daemon-test" else "mx-daemon";
           version = "0.1.0";
           src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
-          inherit buildInputs postUnpack;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "modulix-core-utils-${coreUtils.version}" = coreUtils.narHash;
+            };
+          };
+          inherit buildInputs;
           nativeBuildInputs = nativeBuildInputs
             ++ nixpkgs.lib.optional test pkgs.makeWrapper;
           buildType = if release then "release" else "debug";

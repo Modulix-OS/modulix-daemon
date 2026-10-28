@@ -49,16 +49,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1793123452,
-        "narHash": "sha256-U7fnpti2twWyHsAME3QfPQjV+CE7COHuFwI6j5MFgiA=",
+        "lastModified": 1793191487,
+        "narHash": "sha256-MHagf1LqgmhBZG7nQxhiAKtN6FQd+VpYSUgXgAYEq68=",
         "owner": "Modulix-OS",
         "repo": "modulix-core-utils",
-        "rev": "60dabb2123a84625f3ff94913635ac26ecc2f4e6",
+        "rev": "d6859e835f78fbb5af4c2bdae03dabde8a59b721",
         "type": "github"
       },
       "original": {
         "owner": "Modulix-OS",
-        "ref": "v1.0.2",
+        "ref": "v1.0.3",
         "repo": "modulix-core-utils",
         "type": "github"
       }

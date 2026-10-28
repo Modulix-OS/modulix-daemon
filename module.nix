@@ -131,6 +131,8 @@ in
         config.nix.package
         pkgs.git
         pkgs.pciutils
+        pkgs.cpuid
+        pkgs.usbutils
         "/run/current-system/sw"
       ];
 

@@ -9,7 +9,6 @@ let
   cacheDir = "/var/cache/modulix-os";
 
   buildQueueDir = "/tmp/mx-build-queue";
-  skipRebuildLock = "/tmp/mx-skip-rebuild.lock";
 
   vmResultDir = "${config.users.users.${cfg.testUser}.home}/modulix-vm";
 
@@ -85,13 +84,6 @@ in
       '';
     };
 
-    applyUpdatePackage = lib.mkOption {
-      type        = lib.types.package;
-      default     = coreUtils.mx-apply-update;
-      defaultText = lib.literalMD "`mx-apply-update` from `modulix-core-utils`";
-      description = "Package providing the mx-apply-update binary run at shutdown";
-    };
-
     initPackage = lib.mkOption {
       type        = lib.types.package;
       default     = coreUtils.mx-init;
@@ -110,7 +102,6 @@ in
 
     systemd.tmpfiles.rules = [
       "d ${buildQueueDir} 0755 root root -"
-      "f ${skipRebuildLock} 0644 root root -"
     ] ++ lib.optionals cfg.testMode [
       "d ${vmResultDir} 0755 ${cfg.testUser} users -"
     ];
@@ -149,7 +140,7 @@ in
         StandardError   = "journal";
         SyslogIdentifier = "modulix-daemon";
         PrivateTmp = true;
-        BindPaths = [ buildQueueDir skipRebuildLock ];
+        BindPaths = [ buildQueueDir ];
         CacheDirectory = "modulix-os";
       } // lib.optionalAttrs hasModuleIndex {
         ExecStartPre = "${installModuleIndex}";
@@ -163,38 +154,6 @@ in
       } // lib.optionalAttrs cfg.testMode {
         MX_DAEMON_CONFIG_DIR = "${configDir}/";
         MX_DAEMON_DRY_RUN    = "0";
-      };
-    };
-
-    systemd.services.mx-apply-update = {
-      description = "Apply the staged Modulix system update";
-      wantedBy    = [ "shutdown.target" ];
-      before      = [ "shutdown.target" "umount.target" "final.target" ];
-      after       = [ "local-fs.target" ];
-
-      unitConfig.DefaultDependencies = false;
-
-      path = [
-        config.nix.package
-        pkgs.git
-        "/run/current-system/sw"
-      ];
-
-      serviceConfig = {
-        Type             = "oneshot";
-        ExecStart        = "${cfg.applyUpdatePackage}/bin/mx-apply-update";
-        User             = "root";
-        TimeoutStartSec  = "15min";
-        StandardOutput   = "journal";
-        StandardError    = "journal";
-        SyslogIdentifier = "mx-apply-update";
-        CacheDirectory   = "modulix-os";
-      };
-
-      environment = {
-        MX_CACHE_DIR = cacheDir;
-      } // lib.optionalAttrs cfg.testMode {
-        MX_DAEMON_CONFIG_DIR = "${configDir}/";
       };
     };
 

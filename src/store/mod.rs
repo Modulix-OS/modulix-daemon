@@ -133,25 +133,6 @@ static INSTALLED_CACHE: OnceLock<FlightCache<(), Arc<InstalledSets>>> = OnceLock
 /// [`update_cache`].
 static UPDATE_CACHE: OnceLock<FlightCache<(), Arc<Vec<InputEntry>>>> = OnceLock::new();
 
-/// Candidate `flake.lock` produced by the last [`Store::check_update`], kept
-/// in RAM until the next `UpdateSystem` writes it.
-///
-/// Deliberately **not** a [`FlightCache`]: there is no TTL to honour and the
-/// value is normally taken, not read — it is overwritten by the next check and
-/// emptied by [`take_pending_lock`], whose only caller is
-/// [`crate::staging::stage`]: the staging path takes the candidate instead of
-/// re-probing, and from there it lives on disk
-/// (`modulix_core_utils::staging`), which is what survives a daemon restart.
-/// Holding it means the revisions staged are exactly the ones the check
-/// announced, at the cost of one lockfile's worth of memory and one network
-/// probe instead of two.
-static PENDING_LOCK: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-/// Serialises [`Store::check_update`]: the probe is an unprivileged,
-/// minutes-long `nix flake update`, so concurrent callers must queue behind
-/// one rather than each spawning their own.
-static CHECK_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Key = module name, value = the **bare** plugin names (last component of
 /// each `pkgs.<namespace>.<plugin>` token) currently listed under
 /// `mx.<module>.plugins`. Matching by bare name rather than the full token
@@ -297,6 +278,52 @@ fn installed_cache() -> &'static FlightCache<(), Arc<InstalledSets>> {
 /// of the daemon.
 fn update_cache() -> &'static FlightCache<(), Arc<Vec<InputEntry>>> {
     UPDATE_CACHE.get_or_init(|| FlightCache::new(UPDATE_CACHE_TTL, 1))
+}
+
+/// The direct flake inputs whose upstream revision has moved past the one
+/// pinned in `flake.lock`, cached.
+///
+/// Backs both [`Store::list_outdated_inputs`] and [`Store::check_update`]: a
+/// `#[interface]` method is not callable from another, and the two must not
+/// probe separately — the boolean one would then disagree with the listing a
+/// client reads right after it.
+///
+/// Served from [`UPDATE_CACHE`] when fresh ([`UPDATE_CACHE_TTL`], 1h;
+/// single-flight across concurrent callers, same [`FlightCache`] pattern as
+/// every other cache in this module). On a miss, probes every direct input's
+/// upstream metadata via [`modulix_core_utils::update::outdated_inputs`] —
+/// one `nix flake metadata --refresh` network round-trip per input,
+/// sequential, each bounded by that function's own per-input timeout; an
+/// input whose probe fails is silently absent from the result rather than
+/// failing the whole call (see that function's docs). A completed
+/// `UpdateSystem` call invalidates this cache early (see
+/// [`invalidate_updates`]).
+///
+/// # Parameters
+/// * `force_refresh` - clears the cache before reading, so the probe runs
+///   again whatever its age.
+///
+/// # Returns
+/// One [`InputEntry`] per outdated direct input, behind an `Arc` — the cache
+/// hands out the same allocation to every caller. Empty when every input is
+/// current, and also when `flake.lock` could not be read or parsed, which is
+/// logged at `warn` and not an error.
+async fn outdated_entries(force_refresh: bool) -> Arc<Vec<InputEntry>> {
+    if force_refresh {
+        update_cache().clear();
+    }
+    update_cache()
+        .get_or_fetch((), || async {
+            let inputs =
+                modulix_core_utils::update::outdated_inputs(crate::config_dir::config_dir())
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "outdated_entries");
+                        Vec::new()
+                    });
+            Arc::new(inputs.into_iter().map(InputEntry::from).collect())
+        })
+        .await
 }
 
 /// The cached installed sets. Behind an `Arc`: one search stamps hundreds of
@@ -484,39 +511,6 @@ pub fn invalidate_installed() {
 /// just an expired one.
 pub fn invalidate_updates() {
     update_cache().clear();
-}
-
-/// Hands over the candidate `flake.lock` computed by the last
-/// [`Store::check_update`], emptying the slot.
-///
-/// Called by [`crate::command::update`] at the top of `UpdateSystem`: the
-/// caller owns the lockfile from then on and applies it through
-/// `modulix_core_utils::update::update_with_lock`.
-///
-/// # Returns
-/// `Some(lockfile)` when a check found an update and nothing consumed it yet,
-/// `None` when no check ran, the last one found the system current, or a
-/// previous `UpdateSystem` already took it.
-///
-/// # Post-conditions
-/// [`PENDING_LOCK`] is empty afterwards, whatever it held. A failed update
-/// therefore does **not** put the lockfile back: the next check recomputes it,
-/// which is the safe direction — a rebuild that failed halfway may have moved
-/// the configuration.
-pub fn take_pending_lock() -> Option<String> {
-    PENDING_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-}
-
-/// Drops the candidate `flake.lock`, if any.
-///
-/// # Post-conditions
-/// [`PENDING_LOCK`] is empty; the next `UpdateSystem` re-runs its own check
-/// rather than applying a lockfile whose premises may have changed.
-pub fn clear_pending_lock() {
-    *PENDING_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Resolve every module concurrently (bounded) instead of one at a time —
@@ -1069,16 +1063,8 @@ impl Store {
     /// flake inputs whose upstream revision has moved past the one pinned in
     /// `flake.lock` — what an `UpdateSystem` call would refresh.
     ///
-    /// Served from [`UPDATE_CACHE`] when fresh ([`UPDATE_CACHE_TTL`], 1h;
-    /// single-flight across concurrent callers, same [`FlightCache`] pattern
-    /// as every other cache in this module). On a miss, probes every direct
-    /// input's upstream metadata via
-    /// [`modulix_core_utils::update::outdated_inputs`] — one `nix flake
-    /// metadata --refresh` network round-trip per input, sequential, each
-    /// bounded by that function's own per-input timeout; an input whose
-    /// probe fails is silently absent from the result rather than failing
-    /// the whole call (see that function's docs). A completed `UpdateSystem`
-    /// call invalidates this cache early (see [`invalidate_updates`]).
+    /// The whole probe-and-cache logic is [`outdated_entries`]; this is its
+    /// `a{sv}` rendering.
     ///
     /// # Parameters
     /// * `force_refresh` - when `true`, the cache is cleared before the
@@ -1096,161 +1082,44 @@ impl Store {
     /// # Errors
     /// Never returns `Err`.
     async fn list_outdated_inputs(&self, force_refresh: bool) -> zbus::fdo::Result<Vec<Dict>> {
-        if force_refresh {
-            update_cache().clear();
-        }
-        let entries = update_cache()
-            .get_or_fetch((), || async {
-                let inputs =
-                    modulix_core_utils::update::outdated_inputs(crate::config_dir::config_dir())
-                        .await
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(error = %e, "list_outdated_inputs");
-                            Vec::new()
-                        });
-                Arc::new(inputs.into_iter().map(InputEntry::from).collect())
-            })
-            .await;
+        let entries = outdated_entries(force_refresh).await;
         Ok(entries.iter().cloned().map(InputEntry::into_dict).collect())
     }
 
     /// Serves `CheckUpdate() -> b`: whether refreshing every flake input would
-    /// change anything, and — as a side effect — the preparation of that
-    /// refresh.
+    /// change anything.
     ///
-    /// Unlike [`list_outdated_inputs`](Store::list_outdated_inputs), which
-    /// probes each input's upstream metadata separately, this lets `nix` lock
-    /// the whole flake into a scratch file
-    /// ([`modulix_core_utils::update::check_update`]) and keeps the resulting
-    /// lockfile in [`PENDING_LOCK`]. The next `UpdateSystem` writes that very
-    /// lockfile instead of re-resolving, so the revisions installed are the
-    /// ones this call announced and the network cost is paid once.
-    ///
-    /// [`UPDATE_CACHE`] is refilled from a **local** diff of the two lockfiles
-    /// ([`modulix_core_utils::update::diff_locks`]), so a `ListOutdatedInputs`
-    /// right after is both free and consistent with what will be applied.
-    ///
-    /// Concurrent callers queue behind [`CHECK_GUARD`] rather than each
-    /// spawning a refresh; the second one then re-runs the probe, which is
-    /// what "check again" is supposed to mean.
+    /// The boolean form of
+    /// [`list_outdated_inputs`](Store::list_outdated_inputs), and the very
+    /// same probe: both go through [`outdated_entries`], so a
+    /// `ListOutdatedInputs` right after is free and describes exactly what
+    /// made this call answer `true`. Always forces a fresh probe - "check
+    /// again" is what a client asks this for - and the single-flight of
+    /// [`UPDATE_CACHE`] is what keeps concurrent callers from each spawning
+    /// their own.
     ///
     /// # Returns
-    /// `true` when the candidate lockfile differs from the current one,
-    /// `false` when the system is already current — or when the probe failed,
-    /// which is logged at `warn` and reported as "nothing to update" rather
-    /// than as an error.
+    /// `true` when at least one direct input is behind its upstream revision,
+    /// `false` when every one of them is current — or when the probe failed,
+    /// which is logged at `warn` by [`outdated_entries`] and reported as
+    /// "nothing to update" rather than as an error.
     ///
     /// # Post-conditions
     /// The configuration directory is untouched: no lockfile is written, no
-    /// rebuild runs, no privilege is required. On `true`, [`PENDING_LOCK`]
-    /// holds the candidate until an `UpdateSystem` takes it (see
-    /// [`take_pending_lock`]) or the next check overwrites it; on `false` it is
-    /// emptied. Blocks for the whole refresh, which refetches every input and
-    /// can take **minutes**, not milliseconds.
+    /// rebuild runs, no privilege is required. There is no candidate lockfile
+    /// kept anywhere — an `UpdateSystem` that follows resolves the refresh
+    /// itself, so the revisions it installs are whatever upstream carries
+    /// then, not the ones this call saw. Blocks on one `nix flake metadata
+    /// --refresh` per input, which can take **minutes**, not milliseconds.
     ///
     /// # Errors
     /// Never returns `Err`.
     async fn check_update(&self) -> zbus::fdo::Result<bool> {
-        let _guard = CHECK_GUARD.lock().await;
-
-        let config_dir = crate::config_dir::config_dir();
-        let candidate = match modulix_core_utils::update::check_update(config_dir).await {
-            Ok(candidate) => candidate,
-            Err(e) => {
-                tracing::warn!(error = %e, "check_update");
-                return Ok(false);
-            }
-        };
-
-        let entries = match candidate.as_deref() {
-            Some(lock) => lock_diff_entries(config_dir, lock).await,
-            None => Vec::new(),
-        };
-        update_cache().insert((), Arc::new(entries));
-
-        let found = candidate.is_some();
-        *PENDING_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = candidate;
-        Ok(found)
+        Ok(!outdated_entries(true).await.is_empty())
     }
 
-    /// Serves `StagedUpdate() -> (bbt)`: whether an update is waiting to be
-    /// applied, and whether it is ready to be applied cheaply.
-    ///
-    /// This is what a "restart to finish updating" prompt reads. A Modulix
-    /// update is never applied while the machine is in use: it is resolved and
-    /// pre-built in the background, and the switch happens at shutdown
-    /// (`mx-apply-update.service`). So an up-to-date system and a system with
-    /// everything downloaded and waiting for a reboot look identical to
-    /// [`list_outdated_inputs`](Store::list_outdated_inputs) - this call is how
-    /// they are told apart.
-    ///
-    /// # Returns
-    /// `(staged, built, created_at)`:
-    /// * `staged` - an update is waiting.
-    /// * `built` - its closure is realised in the store **and** still rooted,
-    ///   so applying it at shutdown costs seconds. Reported as `false` once the
-    ///   pre-built closure has been garbage-collected, in which case the next
-    ///   background staging rebuilds it.
-    /// * `created_at` - when it was staged, Unix seconds; `0` when nothing is
-    ///   staged.
-    ///
-    /// # Post-conditions
-    /// A pure read: no process is spawned, nothing is written, and it does not
-    /// block - unlike [`check_update`](Store::check_update), which probes the
-    /// network. Safe to poll.
-    ///
-    /// # Errors
-    /// Never returns `Err`: an unreadable staging area is logged and reported
-    /// as "nothing staged", which is what a caller would do with the error
-    /// anyway.
-    async fn staged_update(&self) -> zbus::fdo::Result<(bool, bool, u64)> {
-        match modulix_core_utils::staging::staged_status() {
-            Ok(Some(status)) => Ok((true, status.built, status.created_at)),
-            Ok(None) => Ok((false, false, 0)),
-            Err(e) => {
-                tracing::warn!(error = %e, "staged_update");
-                Ok((false, false, 0))
-            }
-        }
-    }
-
-    /// Serves `ListStagedInputs() -> aa{sv}`: what the staged update would
-    /// change, input by input.
-    ///
-    /// Same row shape as
-    /// [`list_outdated_inputs`](Store::list_outdated_inputs), but read from the
-    /// staged candidate recorded on disk instead of from a fresh probe, so it
-    /// describes exactly what the next boot will carry.
-    ///
-    /// # Returns
-    /// One `a{sv}` per direct input whose revision the staged update moves, in
-    /// the order the candidate was diffed in. Empty when nothing is staged.
-    ///
-    /// # Post-conditions
-    /// A pure read, like [`staged_update`](Store::staged_update).
-    ///
-    /// # Errors
-    /// Never returns `Err`; an unreadable staging area yields an empty list.
-    async fn list_staged_inputs(&self) -> zbus::fdo::Result<Vec<Dict>> {
-        let status = match modulix_core_utils::staging::staged_status() {
-            Ok(Some(status)) => status,
-            Ok(None) => return Ok(Vec::new()),
-            Err(e) => {
-                tracing::warn!(error = %e, "list_staged_inputs");
-                return Ok(Vec::new());
-            }
-        };
-
-        Ok(status
-            .inputs
-            .into_iter()
-            .map(InputEntry::from)
-            .map(InputEntry::into_dict)
-            .collect())
-    }
-
-    /// Serves `RebootRequired() -> (bas)`: whether the running system still
-    /// needs a reboot, and what moved since it booted.
+    /// Serves `RebootRequired() -> b`: whether the running system still needs
+    /// a reboot to be fully in effect.
     ///
     /// A `nixos-rebuild switch` - what
     /// [`UpdateSystem("switch")`](crate::command::update) does - replaces the
@@ -1262,66 +1131,23 @@ impl Store {
     /// reporting `true` however long ago that was.
     ///
     /// # Returns
-    /// `(required, changed)`:
-    /// * `required` - the running kernel, kernel modules or initrd differ from
-    ///   what the current system closure declares. Exact: it compares
-    ///   `/run/booted-system` with `/run/current-system` rather than guessing
-    ///   from package names.
-    /// * `changed` - one entry per line of `nix store diff-closures` between
-    ///   those two closures, e.g. `linux: 6.6.1 -> 6.6.2`. Informational, and
-    ///   **empty when the diff could not be run** - never infer `required`
-    ///   from it.
+    /// `true` when the running kernel, kernel modules or initrd differ from
+    /// what the current system closure declares. Exact: it compares
+    /// `/run/booted-system` with `/run/current-system` rather than guessing
+    /// from package names, so there is no list of "reboot-worthy" packages to
+    /// keep up to date and no driver it can miss.
     ///
     /// # Post-conditions
-    /// Writes nothing. Unlike [`staged_update`](Store::staged_update) it is
-    /// not a pure read: the first call after an activation spawns
-    /// `nix store diff-closures`. The result is memoised on what
-    /// `/run/current-system` points at, so every later call until the next
-    /// switch is free - but a client should still treat the first one as
-    /// costing a subprocess and not poll it tightly.
+    /// A pure read, like every other method of this interface: three
+    /// `readlink`s, no process spawned, nothing written. Safe to poll.
     ///
     /// # Errors
-    /// Never returns `Err`: a system without `/run/booted-system` or without
-    /// `nix` on `PATH` reports `(false, [])`, which is what a caller would do
-    /// with the error anyway.
-    async fn reboot_required(&self) -> zbus::fdo::Result<(bool, Vec<String>)> {
-        let status = modulix_core_utils::reboot::reboot_status().await;
-        Ok((status.required, status.changed))
+    /// Never returns `Err`: a system without `/run/booted-system` (a
+    /// container, a non-NixOS host) reports `false`, which is what a caller
+    /// would do with the error anyway.
+    async fn reboot_required(&self) -> zbus::fdo::Result<bool> {
+        Ok(modulix_core_utils::reboot::reboot_required())
     }
-}
-
-/// Diffs the configuration's current `flake.lock` against a candidate one,
-/// as the rows `ListOutdatedInputs` serves.
-///
-/// # Parameters
-/// * `config_dir` - configuration repository whose `flake.lock` is the "old"
-///   side of the diff.
-/// * `candidate` - the new lockfile text, as returned by
-///   [`modulix_core_utils::update::check_update`].
-///
-/// # Returns
-/// One [`InputEntry`] per direct input whose revision moved. Empty when only
-/// transitive nodes moved, and empty on failure — an unreadable or unparsable
-/// lockfile is logged at `warn` and degrades the *detail* listing only, never
-/// the boolean [`Store::check_update`] reports.
-async fn lock_diff_entries(config_dir: &str, candidate: &str) -> Vec<InputEntry> {
-    let lock_path = std::path::Path::new(config_dir).join("flake.lock");
-    let current = match tokio::fs::read_to_string(&lock_path).await {
-        Ok(current) => current,
-        Err(e) => {
-            tracing::warn!(error = %e, "check_update: reading flake.lock");
-            return Vec::new();
-        }
-    };
-
-    modulix_core_utils::update::diff_locks(&current, candidate)
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "check_update: diffing lockfiles");
-            Vec::new()
-        })
-        .into_iter()
-        .map(InputEntry::from)
-        .collect()
 }
 
 /// Fetches Flathub enrichment for one app-id. No caching — [`Store::get_app_enrichment`]
@@ -1436,14 +1262,6 @@ async fn build_alt_entries(gid: String, table_attrs: &'static [&'static str]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn take_pending_lock_consumes_the_candidate() {
-        *PENDING_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = Some("candidate".to_string());
-
-        assert_eq!(take_pending_lock().as_deref(), Some("candidate"));
-        assert_eq!(take_pending_lock(), None);
-    }
 
     #[tokio::test]
     async fn packages_for_app_id_serializes() {

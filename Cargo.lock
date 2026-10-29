@@ -965,8 +965,8 @@ dependencies = [
 
 [[package]]
 name = "modulix-core-utils"
-version = "1.0.3"
-source = "git+https://github.com/Modulix-OS/modulix-core-utils?tag=v1.0.3#d6859e835f78fbb5af4c2bdae03dabde8a59b721"
+version = "1.1.1"
+source = "git+https://github.com/Modulix-OS/modulix-core-utils?tag=v1.1.1#ee36c1530c6a8a190b35cd50fdb6159e38d09657"
 dependencies = [
  "const_format",
  "git2",
@@ -985,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "modulix-daemon"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "futures",

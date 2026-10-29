@@ -143,10 +143,10 @@ impl Listener for Hostname1Listener {
 fn report_hostname_changed(hostname: &str) {
     tracing::info!(hostname, "detected pretty hostname change request");
 
-    if !crate::dry_run::is_dry_run() {
-        if let Err(error) = modulix_core_utils::hostname::change_hostname(hostname) {
-            tracing::error!(hostname, %error, "failed to change hostname");
-        }
+    if !crate::dry_run::is_dry_run()
+        && let Err(error) = modulix_core_utils::hostname::change_hostname(hostname)
+    {
+        tracing::error!(hostname, %error, "failed to change hostname");
     }
 }
 

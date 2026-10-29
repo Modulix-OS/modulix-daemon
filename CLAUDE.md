@@ -27,12 +27,12 @@ This is a Nix flake. Do **not** build outside the flake env (needs `pkg-config` 
 
 ### `modulix-core-utils` comes from GitHub, pinned by tag
 
-`Cargo.toml` depends on `git = "https://github.com/Modulix-OS/modulix-core-utils", tag = "v1.0.3"`, not on a sibling `path`. The old path dependency only worked because `flake.nix` copied the flake input into `$NIX_BUILD_TOP/modulix-core-utils` from `postUnpack`; that hack is gone, and `Cargo.lock` is now the single source of truth for the compiled rev.
+`Cargo.toml` depends on `git = "https://github.com/Modulix-OS/modulix-core-utils", tag = "v1.1.1"`, not on a sibling `path`. The old path dependency only worked because `flake.nix` copied the flake input into `$NIX_BUILD_TOP/modulix-core-utils` from `postUnpack`; that hack is gone, and `Cargo.lock` is now the single source of truth for the compiled rev.
 
-**Two pins, one hand-edited number, no silent drift.** The crate is pinned by `Cargo.lock` (what the daemon compiles against) *and* by the flake input (whose packages `module.nix` takes `mx-apply-update` and `mx-init` from — that is why the input survived the move). A flake input url cannot read a file, so the tag string genuinely has to be written twice: in `Cargo.toml` and in `flake.nix`. Everything else is derived, and a disagreement is an eval error.
+**Two pins, one hand-edited number, no silent drift.** The crate is pinned by `Cargo.lock` (what the daemon compiles against) *and* by the flake input (whose packages `module.nix` takes `mx-init` from — that is why the input survived the move). A flake input url cannot read a file, so the tag string genuinely has to be written twice: in `Cargo.toml` and in `flake.nix`. Everything else is derived, and a disagreement is an eval error.
 
 - `flake.nix`'s `coreUtils` binding parses `Cargo.lock` with `builtins.fromTOML`, pulls the rev out of the `git+…#<rev>` source, and compares it with `modulix-core-utils.rev`. Mismatch → `throw` naming both revs and the two commands to run. A lock whose `source` line was eaten by a local `[patch]` throws its own message instead.
-- `cargoLock.outputHashes` is keyed `"modulix-core-utils-${coreUtils.version}"` with `coreUtils.narHash`, i.e. the crate version from `Cargo.lock` and the input's `narHash` from `flake.lock`. Nothing to recompute by hand on a bump: a `github:` input's `narHash` is the NAR of the unpacked tree, which is exactly what `rustPlatform`'s `fetchgit` of the same rev produces (verified on v1.0.2 and v1.0.3). It would only diverge if the repo gained submodules, and then the hash-mismatch error prints the right value.
+- `cargoLock.outputHashes` is keyed `"modulix-core-utils-${coreUtils.version}"` with `coreUtils.narHash`, i.e. the crate version from `Cargo.lock` and the input's `narHash` from `flake.lock`. Nothing to recompute by hand on a bump: a `github:` input's `narHash` is the NAR of the unpacked tree, which is exactly what `rustPlatform`'s `fetchgit` of the same rev produces (verified on v1.0.2, v1.0.3 and v1.1.x). It would only diverge if the repo gained submodules, and then the hash-mismatch error prints the right value.
 - Bumping core-utils is therefore: edit the tag in `Cargo.toml` and in `flake.nix`, then `cargo update -p modulix-core-utils` and `nix flake update modulix-core-utils`. Forget either command and `nix build` refuses to start.
 - **Local development against a sibling checkout** uses `.cargo/config.toml` (gitignored via `/.cargo/`):
   ```toml
@@ -79,151 +79,115 @@ Genericity via traits so new listened interfaces and new own-interface commands 
 
 Adding work = add a new trait impl (listened interface) or a new interface method + handler (own interface); both funnel into the "info log → dry-run-gated library call" pattern above.
 
-## System updates — staged, applied at shutdown or on demand
+## System updates — two modes, both applied on the spot
 
-**An automatic update is never applied while the machine is in use; a manual
-one is.** The split is by *who asked*, not by what is possible: a background
-update is only ever resolved and pre-built, and the `nixos-rebuild boot` that
-makes it the next boot's default runs at shutdown, so it takes effect on
-restart — whereas `UpdateSystem("switch")`, the "Update Now" a user clicked,
-activates the pre-built system immediately. No `UpdateSystem` mode writes a
-bootloader entry while the session runs except the explicit administrative
-`"apply"`. The mechanism lives in `modulix_core_utils::staging`; this daemon
-drives it.
+`modulix_core_utils::update::update(config_dir, build_command, cores)` is the
+only update entry point the library exposes, and it does everything in one
+blocking call: `nix flake update` inside its own commit, then the rebuild, and
+both only if `flake.lock` actually moved. There is no staging area, no
+pre-resolved candidate lockfile and no shutdown unit — all of that was removed
+in core-utils v1.1.0 and is not coming back (see the note at the end of this
+section for why a "download now, apply later" split is no longer
+expressible).
 
-- `Store1.CheckUpdate() -> b` (`src/store/mod.rs`) calls
-  `modulix_core_utils::update::check_update`, which runs a full
-  `nix flake update --output-lock-file <scratch>` — **nothing in the config
-  directory is written**, so this stays on the unprivileged read interface. The
-  resulting candidate `flake.lock` is parked in `PENDING_LOCK`, a plain
-  `Mutex<Option<String>>`: no TTL, take-once, overwritten by the next check.
-  Concurrent callers queue behind `CHECK_GUARD` (a `tokio::sync::Mutex`).
-  `PENDING_LOCK`'s only consumer is now `staging::stage`, which stages that
-  candidate instead of probing a second time; from there it lives on disk,
-  which is what survives a daemon restart.
-- The same call refills `UPDATE_CACHE` from `update::diff_locks`, a purely
-  local diff of the two lockfiles. So `ListOutdatedInputs` right after is free
-  and consistent by construction with what an update would apply.
-- `Store1.StagedUpdate() -> (bbt)` and `Store1.ListStagedInputs() -> aa{sv}`
-  are the read side of the staging area: `(staged, built, created_at)` and the
-  per-input rows of what the next boot will carry. Pure reads, no probe — this
-  is what a "restart to finish updating" prompt reads, since an up-to-date
-  system and one waiting for a reboot look identical to `ListOutdatedInputs`.
-- `Daemon.UpdateSystem(mode)` (`src/command/update.rs`), five modes. The mode
-  table is the pure `fn steps(mode) -> Option<Steps>`, which is *also* the mode
-  validation — there is no second `matches!` to keep in sync:
-  - `"build"` / `"stage"` → `staging::stage_update`: resolve + `nixos-rebuild
-    build`, nothing applied. Half the cores.
-  - `"boot"` → `staging::stage_update` too, and nothing else. The
-    `nixos-rebuild boot` that promotes the staged system is
-    `mx-apply-update.service`'s job at shutdown and is never run from the
-    daemon, so `"boot"` does the same *work* as `"build"` and differs only in
-    its reply — which is what sends GNOME Software's row to
-    `PENDING_INSTALL`. This is the mode the plugin's **unattended** apply job
-    sends; a click sends `"switch"` (see below).
-  - `"switch"` → stage if needed, then `staging::apply_staged_with(…,
-    Activation::Switch)`: `nixos-rebuild switch`, **the running system is
-    replaced**. The manual path, and the only mode that does this. This is what
-    GNOME Software's "Update Now" sends: `update_mode_for_flags()` in
-    `gnome-software-plugin` reads `GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE`,
-    which every click-driven path sets and `gs-update-monitor.c` never does.
-  - `"apply"` → `Activation::Boot` only, no staging. Administrative escape
-    hatch that promotes for the next boot by hand; the normal path is the
-    shutdown unit.
-  Dry run short-circuits every mode *including the probe*, returning the mode's
-  success message.
-- **The promotion for the next boot only ever happens at shutdown.**
-  `mx-apply-update.service` (mxpkgs) runs core-utils' `mx-apply-update` binary
-  before `shutdown.target`. That binary calls `apply_staged`, which is
-  `apply_staged_with(…, Activation::Boot)` under its own name — the shutdown
-  path cannot pick `Switch` by accident, and no `UpdateSystem` mode but the
-  explicit `"apply"` can pick `Boot`. A machine that loses power instead of
-  shutting down cleanly never runs it: the staged update stays on disk and the
-  next clean shutdown applies it.
+- `Daemon.UpdateSystem(mode)` (`src/command/update.rs`) takes two modes. The
+  table is the pure `fn build_command(mode) -> Option<BuildCommand>`, which is
+  *also* the mode validation — there is no second `matches!` to keep in sync:
+  - `"switch"` → `BuildCommand::Switch`: `nixos-rebuild switch`, **the running
+    system is replaced**. This is what GNOME Software's "Update Now" sends:
+    `update_mode_for_flags()` in `gnome-software-plugin` reads
+    `GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE`, which every click-driven path
+    sets and `gs-update-monitor.c` never does.
+  - `"boot"` → `BuildCommand::Boot`: `nixos-rebuild boot`, the running system
+    is left alone and the new one becomes the next boot's default. This is the
+    mode the plugin's unattended apply job sends.
+  Both are capped to half the cores (`background_cores`), so the session in
+  progress keeps its share of the machine. Dry run short-circuits both,
+  returning the mode's success message.
+  `"build"`, `"stage"` and `"apply"` are **gone** and are rejected as unknown
+  modes; a client still sending one finds out rather than being silently
+  served `"boot"`.
+- **The reply does not say whether anything was rebuilt.** `update` returns
+  `Ok(())` both when it rebuilt and when every input was already current, so
+  `UpdateSystem` answers `"system updated"` / `"system update prepared for
+  next boot"` either way. A client that needs the distinction asks
+  `Store1.ListOutdatedInputs` again, or `Store1.RebootRequired` after a
+  `"switch"`. There is no `"system already up to date"` reply any more.
+- `Store1.CheckUpdate() -> b` and `Store1.ListOutdatedInputs(b) -> aa{sv}`
+  (`src/store/mod.rs`) are the read side, and they share one probe: the free
+  function `outdated_entries(force_refresh)` behind `UPDATE_CACHE`
+  (`FlightCache`, 1 h TTL, single-flight). It calls
+  `modulix_core_utils::update::outdated_inputs`, which asks `nix flake
+  metadata <ref> --json --refresh --no-write-lock-file` once per direct input
+  and **writes nothing at all** — not the configuration's `flake.lock`, not a
+  scratch file — which is why this stays on the unprivileged read interface.
+  `CheckUpdate` is `!outdated_entries(true).await.is_empty()`, so a
+  `ListOutdatedInputs` right after it is free and describes exactly what made
+  it answer `true`. A `#[interface]` method cannot call another, which is the
+  reason `outdated_entries` is a free function rather than a third method.
+- **Nothing is kept between a check and an update.** The revisions an
+  `UpdateSystem` installs are whatever upstream carries when it runs, not the
+  ones a `CheckUpdate` saw. `PENDING_LOCK`, `take_pending_lock`,
+  `clear_pending_lock`, `CHECK_GUARD` and `lock_diff_entries` are gone with
+  the candidate they existed for.
+- `Store1.StagedUpdate` and `Store1.ListStagedInputs` are **removed**: there
+  is no staging area to report on, and nothing in mxpkgs,
+  `gnome-software-plugin` or `modulix-store-client` ever called them.
 
-`Activation` is a two-variant public enum in `modulix_core_utils::staging`, not
-the crate's internal `BuildCommand`. `BuildCommand` has six variants, four of
-which are meaningless or destructive here (`Install` is
-`nixos-install --root /mnt`), and it is not public anyway — `core-utils`'
-`src/lib.rs` declares `mod core;` privately. Keeping the narrow type makes the
-bad choices unrepresentable instead of rejected at run time.
+**Why there is no build-without-activating mode.** `BuildCommand::Build`
+still exists in core-utils, but `update()` hardcodes `UpdateInput::UpdateAll`
+and commits the refreshed `flake.lock` as part of the same transaction. A
+`"build"` mode would therefore commit the new lock, and the `"switch"` that
+followed would find `nix flake update` moving nothing — no commit, no rebuild,
+nothing activated. The download and build cost is paid by whichever of the two
+real modes runs; the plugin's `NO_APPLY` download step is a no-op on its side.
 
-**Why a `"switch"` does not corrupt the transaction it runs from.**
-`switch-to-configuration` would normally restart a unit whose definition
-changed — here, killing the daemon mid-transaction. Three facts, all verified,
-keep that from happening and should not be re-derived:
-
-- the unit sets `restartIfChanged = false` and `stopIfChanged = false`
-  (mxpkgs `modulixos/modulix-daemon/default.nix`), so the activation leaves it
-  alone;
-- nixpkgs gives `dbus.service` `reloadIfChanged = true`
-  (`nixos/modules/services/system/dbus.nix`, "Don't restart dbus-daemon. Bad
-  things tend to happen if we do."), so the bus is reloaded and the daemon
-  never loses its connection;
-- `polkit` *is* restarted (`restartTriggers = [ config.system.path ]`) and so
-  is `udisks2`, both harmlessly: `src/polkit.rs` builds its `AuthorityProxy`
-  per call, and the UDisks2 listeners' `BecomeMonitor` match rules live on the
-  bus rather than on a connection to `udisksd`, while `Watchers::spawn`
-  deduplicates a live watcher to preserve its baseline.
-
-The consequence to live with: `restartIfChanged = false` means an update
-carrying a new daemon keeps being served by the **old** binary until the next
-boot or an explicit `systemctl restart`. A client must not assume a fresh
-version's methods exist right after a `"switch"`.
+**`Store1.RebootRequired() -> b` is how a client tells "updated" from
+"updated, restart to finish" after a `"switch"`.** A `nixos-rebuild switch`
+cannot replace the kernel, the kernel modules or the initrd the machine is
+*running*, so a successful switch may still owe a reboot — or may not, if it
+moved only userspace. `modulix_core_utils::reboot::reboot_required` settles it
+exactly, by comparing `/run/booted-system` with `/run/current-system` on those
+three entries; there is no list of "reboot-worthy" package names to maintain
+and so no driver it can miss. `systemd` is deliberately not among them:
+`switch-to-configuration` re-executes it in place. Three `readlink`s, no
+subprocess, no memo — it is a pure read like every other `Store1` method. The
+`nix store diff-closures` listing the reply used to carry is gone with the
+`(bas)` signature: describing *what* moved is a different question, and no
+caller read it for anything but display.
 
 **Invariant: the committed `flake.lock` is the one the running system was built
-from.** The staged candidate lives under `cache_dir()/pending-update/`, never in
-the git tree, so an install that happens while an update waits commits with
-`UpdateInput::Keep` and cannot drag the update in. `apply_staged_with` promotes
-the candidate (commit without rebuild) only after the new system is built and
-either registered as next boot's or activated.
+from.** `update()` commits the refreshed lock and rebuilds in one transaction,
+or does neither. An install that happens meanwhile commits with
+`UpdateInput::Keep` and cannot drag a refresh in.
 
 **`cache_dir()` is `/var/cache/modulix-os`, and it must stay outside the
-configuration repository.** It used to be `/etc/modulix-os/.cache`, which broke
-every staged build: `nixos-rebuild --flake` is pointed at the bare path of the
-`.git`-less staged copy, and `nix` resolves a bare path by walking its
-*parents* looking for a git root. That walk reached `/etc/modulix-os/.git`, the
-copy was read as a `git+file://` flake restricted to tracked files, and the
-build died with `Path '.cache/pending-update/config/flake.nix' … is not tracked
-by Git`. Listing the directory in `.git/info/exclude` does not help — excluded
-is still untracked as far as `nix` is concerned. Outside any repository the same
-bare path is read as a `path:` flake, which is what
-`modulix_core_utils::staging` relies on. The directory is created by
-`CacheDirectory = "modulix-os"` on both `modulix-daemon.service` and
-`mx-apply-update.service` (mxpkgs), and `MX_CACHE_DIR` points core-utils at it.
-A machine installed before the move keeps an inert `/etc/modulix-os/.cache`,
-still excluded; `rm -rf` it by hand.
+configuration repository.** It holds the module and package indexes and
+core-utils' ESP probe mount points. The constraint is `nix`'s: it resolves a
+bare path by walking its *parents* looking for a git root, so a flake
+directory placed under this one is read as a `git+file://` flake restricted to
+tracked files rather than as the `path:` flake it is. While the cache lived
+under `/etc/modulix-os/.cache` that walk reached the configuration repository,
+and nothing untracked written there was visible to `nix`. Listing the
+directory in `.git/info/exclude` does not help — excluded is still untracked
+as far as `nix` is concerned. The directory is created by `CacheDirectory =
+"modulix-os"` on `modulix-daemon.service` (`module.nix`), and `MX_CACHE_DIR`
+points core-utils at it. A machine installed before the move keeps an inert
+`/etc/modulix-os/.cache`; `rm -rf` it by hand.
 
-`CheckUpdate`, `StagedUpdate`, `ListStagedInputs` and `RebootRequired` need no
-polkit action (they are `Store1` reads) and no `Command` impl, so
+`CheckUpdate`, `ListOutdatedInputs` and `RebootRequired` need no polkit action
+(they are `Store1` reads) and no `Command` impl, so
 `org.modulix.daemon.policy`, `org.modulix.Daemon.conf` and
 `command::registry()` are untouched by them.
-
-**`Store1.RebootRequired() -> (bas)` (`src/store/mod.rs`) is how a client tells
-"updated" from "updated, restart to finish" after a `"switch"`.** A
-`nixos-rebuild switch` cannot replace the kernel, the kernel modules or the
-initrd the machine is *running*, so a successful switch may still owe a reboot —
-or may not, if it moved only userspace. `modulix_core_utils::reboot` settles it
-exactly, by comparing `/run/booted-system` with `/run/current-system` on those
-three entries; there is no list of "reboot-worthy" package names to maintain and
-so no driver it can miss. `systemd` is deliberately not among them:
-`switch-to-configuration` re-executes it in place. The second member of the
-reply is `nix store diff-closures` between the two closures — the same tool
-`mx-latest-update` uses, but between booted and current rather than between the
-last two profile generations, because "what changed since boot" is the question
-a reboot prompt answers. That list is **informational only**: it is empty when
-the diff could not be run, and the boolean never depends on it. The result is
-memoised on what `/run/current-system` points at, so the `nix` subprocess runs
-at most once per activation — the one reason this `Store1` method is not a pure
-read like the others.
 
 ## Hardware re-detection (`UpdateHardware`)
 
 `Daemon.UpdateHardware()` (`src/command/hardware.rs`) calls
-`modulix_core_utils::hardware_config::redetect_hardware_options`, which probes
-the **live** machine (GPU slots from sysfs, laptop chassis, fingerprint reader)
-and writes the `mx.hardware.*` options into `hardware.nix`. It takes no
-argument: there is nothing to name, the hardware is whatever is plugged in.
+`modulix_core_utils::hardware_config::redetect_all_hardware`, which probes the
+**live** machine (GPU slots from sysfs, laptop chassis, fingerprint reader),
+regenerates `hardware-configuration.nix` and writes the `mx.hardware.*`
+options into `hardware.nix`. It takes no argument: there is nothing to name,
+the hardware is whatever is plugged in.
 
 - **Its own polkit action, `auth_admin`.** `polkit::ACTION_HARDWARE`
   (`org.modulix.daemon.hardware`) sits with `ACTION_INSTALL`/`ACTION_REMOVE`,
@@ -231,19 +195,20 @@ argument: there is nothing to name, the hardware is whatever is plugged in.
   background update completes unattended, which is exactly what rewriting
   `hardware.nix` and activating the result must *not* do.
 - **Shape is `filesystem::add_mount`'s, not `UpdateSystem`'s.**
-  `redetect_hardware_options` is a synchronous `make_transaction(…,
-  BuildCommand::Switch, UpdateInput::Keep, …)`, so the handler wraps it in
+  `redetect_all_hardware` is a synchronous `make_group_transaction(…,
+  BuildCommand::Switch, UpdateInput::Keep, …)` — both hardware files in one
+  commit and one rebuild — so the handler wraps it in
   `tokio::task::spawn_blocking` (the `src/command/lifecycle.rs` pattern) and
   relies on `Daemon::run` for `shutdown::enter` and `rebuild::guard`. It
   replaces the running system like `UpdateSystem("switch")` — and like it does
-  not restart the daemon — while `UpdateInput::Keep` keeps a staged update out.
+  not restart the daemon — while `UpdateInput::Keep` keeps a flake refresh out.
 - **No "something changed" signal.** The detection is idempotent and a
-  topology identical to the file produces no commit and no rebuild, but
+  topology identical to the files produces no commit and no rebuild, but
   core-utils returns `Ok(())` either way, so the reply is
   `"hardware configuration updated"` in both cases. A client that needs the
   distinction reads `Store1.RebootRequired`. Nothing is invalidated in
-  `Daemon::run`: neither the installed-package list nor the staging area
-  changes.
+  `Daemon::run`: the installed-package list does not change, and there is
+  nothing else to invalidate.
 - `hardware-config` must stay in the `modulix-core-utils` feature list in
   `Cargo.toml` — it gates the whole module, and it pulls `regex` into
   `Cargo.lock`, which `flake.nix` consumes via `cargoLock.lockFile`.
@@ -259,25 +224,30 @@ A configuration transaction is not interruptible: core-utils implements no
 `Drop` on its `Transaction` and keeps no journal, so a process killed between
 the commit and the end of the rebuild leaves the repository committed ahead of
 the running system, files sealed `chattr +i`, and an auto-stash nobody pops.
-Three things keep that from happening:
+Since core-utils v1.1.0 there is no repair path either — `staging::repair_after_crash`
+and `Transaction::restore_orphan_stashes` are gone, so such a stash has to be
+popped by hand. Two things keep that from happening:
 
 - **The unit does not restart itself.** `systemd.services.modulix-daemon` in
-  mxpkgs sets `restartIfChanged = false`, `stopIfChanged = false` and
+  `module.nix` sets `restartIfChanged = false`, `stopIfChanged = false` and
   `KillMode = "process"`. Without them, `switch-to-configuration` restarts the
   daemon during the very activation it started, and the default
   `KillMode=control-group` takes `nixos-rebuild` *and*
   `switch-to-configuration` down with it. A new binary therefore only takes
   effect at the next boot or on an explicit `systemctl restart`.
-- **The rebuild lives in its own cgroup.** `Transaction::rebuild_config` wraps
-  the command in `systemd-run --collect --wait --pipe --unit=mx-rebuild-<pid>-<n>`
-  when `INVOCATION_ID` is set, so it survives any stop of the daemon unit. That
-  is also why the build scratch moved from `/tmp` to `cache_dir()`: with
-  `PrivateTmp`, a transient unit does not see the daemon's `/tmp`.
 - **`SIGTERM` drains instead of killing.** `shutdown::enter` refuses new
   transactions once a signal arrived, `wait_drained` waits for the ones in
-  flight, then the process exits 0 — within the unit's `TimeoutStopSec`.
-  `main` calls `staging::repair_after_crash` before serving, which pops the
-  auto-stash a previous `SIGKILL` left behind.
+  flight, then the process exits 0 — within the unit's `TimeoutStopSec`
+  (30 min, longer than a rebuild).
+
+**Accepted regression: the rebuild no longer has its own cgroup.** v1.1.0
+removed the `systemd-run --collect --wait --pipe --unit=mx-rebuild-<pid>-<n>`
+wrapper from `Transaction::rebuild_config`; `transaction.rs` now says a caller
+that could be restarted by its own rebuild has to put it in a transient unit
+itself, and this daemon does not. So `nixos-rebuild` is a plain child process:
+`KillMode = "process"` is what keeps a `systemctl stop modulix-daemon` from
+taking it down, and past `TimeoutStopSec` a `SIGKILL` can still interrupt a
+transaction with nothing to clean it up afterwards.
 
 `rebuild::guard()` is the single lock every configuration transaction of this
 process takes: `Daemon::run` holds it for every command, and

@@ -1,11 +1,11 @@
 //! Re-detect the machine's hardware and write the result to `hardware.nix`.
 //!
-//! Wired to [`modulix_core_utils::hardware_config::redetect_hardware_options`],
+//! Wired to [`modulix_core_utils::hardware_config::redetect_all_hardware`],
 //! which probes the **live** machine (GPU slots from sysfs, laptop chassis,
-//! fingerprint reader), writes the `mx.hardware.*` options it found and
-//! rebuilds the system. Serves the `UpdateHardware` D-Bus method, which takes
-//! no argument: there is nothing to name, the hardware is whatever is plugged
-//! in.
+//! fingerprint reader), regenerates `hardware-configuration.nix` and writes
+//! the `mx.hardware.*` options it found - both in one commit and one rebuild.
+//! Serves the `UpdateHardware` D-Bus method, which takes no argument: there is
+//! nothing to name, the hardware is whatever is plugged in.
 //!
 //! That call is a single configuration transaction ending in a
 //! `nixos-rebuild switch`, so it blocks for the whole rebuild (can be minutes)

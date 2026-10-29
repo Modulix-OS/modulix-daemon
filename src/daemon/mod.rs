@@ -120,33 +120,18 @@ impl Daemon {
     /// every command reachable through this path, since all of them are
     /// named `Install*`/`Uninstall*`.
     ///
-    /// On success of `"UpdateSystem"` specifically, and only when its mode
-    /// actually applied something — `"switch"` and `"apply"`, see below:
-    /// `crate::store`'s outdated-inputs cache is invalidated via
-    /// `crate::store::invalidate_updates` (a completed update should not keep
-    /// reporting itself as outdated), the candidate lockfile slot is
-    /// emptied via `crate::store::clear_pending_lock` (the command already took it;
-    /// this also covers a check that landed while the update was running), and
-    /// the package index's nixpkgs fingerprint is invalidated with a
-    /// background refresh spawned (not awaited — same non-blocking shape as
+    /// On success of `"UpdateSystem"`: `crate::store`'s outdated-inputs cache
+    /// is invalidated via `crate::store::invalidate_updates` (a completed
+    /// update should not keep reporting itself as outdated), and the package
+    /// index's nixpkgs fingerprint is invalidated with a background refresh
+    /// spawned (not awaited — same non-blocking shape as
     /// `spawn_rebuild_signal_handler`'s SIGHUP handler in `src/main.rs`,
     /// which this reuses) since a successful update moves nixpkgs out from
     /// under the index.
     ///
-    /// `UpdateSystem("build")`, `UpdateSystem("stage")` and
-    /// `UpdateSystem("boot")` are exempt from all three: they only resolve and
-    /// realise a candidate and leave the promotion to
-    /// `mx-apply-update.service`, so the system is still outdated afterwards
-    /// (the row must keep showing), the committed lockfile has not moved, and
-    /// nixpkgs has not moved under the index. Exempting `"boot"` matters in
-    /// practice: it is the mode GNOME Software's apply job sends, so counting
-    /// it as an apply would spend a background package-index refresh on every
-    /// update that changed nothing yet.
-    ///
-    /// A successful `Install*`/`Uninstall*` also kicks off a background
-    /// re-staging ([`crate::staging::spawn_background_stage`]): the install
-    /// moved the configuration on, so the staged pre-build no longer matches
-    /// what a shutdown would activate.
+    /// Both remaining modes qualify: `"switch"` and `"boot"` each commit the
+    /// refreshed `flake.lock`, so the system is no longer outdated whichever
+    /// one ran, and nixpkgs has moved under the index in both cases.
     ///
     /// # Errors
     /// Returns an error, and skips both execution and cache invalidation,
@@ -178,16 +163,11 @@ impl Daemon {
         let _guard = crate::rebuild::guard().await;
         let result = command.execute(arguments).await;
 
-        let applied_update =
-            name == "UpdateSystem" && matches!(arguments.first(), Some(&"switch") | Some(&"apply"));
-
         if result.is_ok() {
             if name.starts_with("Install") || name.starts_with("Uninstall") {
                 crate::store::invalidate_installed();
-                crate::staging::spawn_background_stage(crate::command::update::background_cores());
-            } else if applied_update {
+            } else if name == "UpdateSystem" {
                 crate::store::invalidate_updates();
-                crate::store::clear_pending_lock();
                 modulix_core_utils::package_index::invalidate_fingerprint();
                 tokio::spawn(modulix_core_utils::package_index::ensure_fresh_in_background());
             }
@@ -494,55 +474,49 @@ impl Daemon {
     ///
     /// # Parameters
     /// * `mode` - `"switch"` to rebuild and activate immediately (a
-    ///   user-triggered "Update Now"), `"boot"` to stage the update the next
-    ///   boot will carry (GNOME Software applying an update by itself),
-    ///   `"build"` — or its synonym `"stage"` — for the same work under the
-    ///   "download" reply, or `"apply"` to promote what is already staged and
-    ///   nothing else. See `crate::command::update` for which modes touch the
-    ///   running system and for how `mode` also decides the CPU-core cap on
-    ///   the rebuild.
+    ///   user-triggered "Update Now"), `"boot"` to rebuild and make the
+    ///   result the next boot's system without touching the running one
+    ///   (GNOME Software applying an update by itself). See
+    ///   `crate::command::update` for the whole mode table and for the
+    ///   CPU-core cap on the rebuild.
     ///
     /// # Pre-conditions
     /// The caller must be authorized for the [`ACTION_UPDATE`] polkit
     /// action. Unlike [`ACTION_INSTALL`]/[`ACTION_REMOVE`], the policy
-    /// grants this to any active session with no `auth_admin` prompt, so a
-    /// background-prepared update can complete unattended.
+    /// grants this to any active session with no `auth_admin` prompt, so an
+    /// unattended update can complete on its own.
     ///
     /// # Returns
     /// `"system updated"` for `"switch"`, `"system update prepared for next
-    /// boot"` for `"boot"`/`"apply"` or `"system update downloaded"` for
-    /// `"build"`/`"stage"`, once the build has completed, or `"system already
-    /// up to date"` when there was nothing to apply.
+    /// boot"` for `"boot"`, once the rebuild has completed. The same string
+    /// is returned when every input was already current and nothing was
+    /// rebuilt: `modulix-core-utils` reports no distinction. A client that
+    /// needs to know reads `Store1.ListOutdatedInputs` again, or
+    /// `Store1.RebootRequired`.
     ///
     /// # Post-conditions
-    /// The candidate `flake.lock` left by the last `Store1.CheckUpdate` is
-    /// written as-is, so the revisions installed are the ones that check
-    /// announced; with no candidate pending, the refresh is resolved here
-    /// first. Every mode that stages consumes that candidate — all of them but
-    /// `"apply"`, which stages nothing.
+    /// The refresh is resolved here, at apply time: there is no staging area
+    /// and no pre-resolved candidate, so the revisions installed are the ones
+    /// upstream carries now. `flake.lock` is committed only if it moved, and
+    /// the rebuild runs only then.
     ///
-    /// **`"switch"` is the only mode that replaces the running system**; it
-    /// does not restart this daemon, so an update carrying a new daemon keeps
-    /// being served by the old binary until the next boot. `"apply"` changes
-    /// only what the machine boots next. `"build"`, `"stage"` and `"boot"`
-    /// change neither: they realise the new closure and leave it staged, and
-    /// the `nixos-rebuild boot` that promotes it is run by
-    /// `mx-apply-update.service` at shutdown.
+    /// **`"switch"` replaces the running system**; it does not restart this
+    /// daemon, so an update carrying a new daemon keeps being served by the
+    /// old binary until the next boot. `"boot"` leaves the running system
+    /// alone and writes a bootloader entry instead — nothing defers that to
+    /// shutdown any more.
     ///
-    /// The call blocks for the whole build — potentially **minutes** — plus
-    /// that probe when it runs. Unless [`crate::dry_run::is_dry_run`] is true
-    /// (the default in debug builds), a successful `"switch"`/`"apply"` also
-    /// invalidates the outdated-inputs cache and kicks off a background
-    /// package-index refresh (see `Daemon::run`); the three staging modes
-    /// invalidate nothing.
+    /// The call blocks for the whole rebuild — potentially **minutes**.
+    /// Unless [`crate::dry_run::is_dry_run`] is true (the default in debug
+    /// builds), success invalidates the outdated-inputs cache and kicks off a
+    /// background package-index refresh (see `Daemon::run`).
     ///
     /// # Errors
-    /// A D-Bus error reply is returned, and no build is attempted, if the
+    /// A D-Bus error reply is returned, and no rebuild is attempted, if the
     /// caller declines or is otherwise denied polkit authorization, or if
-    /// `mode` is none of `"switch"`, `"boot"`, `"build"`, `"stage"` and
-    /// `"apply"`. A D-Bus error reply is also returned if the underlying
-    /// `modulix-core-utils` call fails, in which case the configuration is
-    /// left unchanged.
+    /// `mode` is neither `"switch"` nor `"boot"`. A D-Bus error reply is also
+    /// returned if the underlying `modulix-core-utils` call fails, in which
+    /// case the configuration is left unchanged.
     async fn update_system(
         &self,
         mode: &str,
@@ -559,7 +533,7 @@ impl Daemon {
     ///
     /// Takes no argument: the topology is read from the machine, not from the
     /// caller. The handler is `crate::command::hardware`, which delegates to
-    /// `modulix_core_utils::hardware_config::redetect_hardware_options`.
+    /// `modulix_core_utils::hardware_config::redetect_all_hardware`.
     ///
     /// # Pre-conditions
     /// The caller must be authorized for the [`ACTION_HARDWARE`] polkit
@@ -585,8 +559,8 @@ impl Daemon {
     /// The call blocks for the whole `nixos-rebuild switch` — potentially
     /// **minutes**. Everything is skipped, and the status string returned
     /// anyway, when [`crate::dry_run::is_dry_run`] is true (the default in
-    /// debug builds). No cache is invalidated: neither the installed-package
-    /// list nor the staging area changes.
+    /// debug builds). No cache is invalidated: the installed-package list does
+    /// not change, and there is nothing else to invalidate.
     ///
     /// # Errors
     /// A D-Bus error reply is returned, and no rebuild is attempted, if the

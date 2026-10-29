@@ -5,9 +5,9 @@
 //! process killed between the commit and the end of the rebuild leaves the
 //! repository committed ahead of the running system, its files still sealed
 //! `chattr +i`, and the caller's uncommitted work stuck in an auto-stash
-//! nothing will pop. There is no resume path: the damage is only recoverable,
-//! partially, by `modulix_core_utils::staging::repair_after_crash` at the next
-//! start-up.
+//! nothing will pop. There is no resume path and, since core-utils v1.1.0, no
+//! repair path either: the crate no longer exposes anything that pops such a
+//! stash, so the only defence is not being killed in the first place.
 //!
 //! So the daemon has to outlive its own `SIGTERM` long enough to finish. On the
 //! signal it stops accepting new transactions ([`enter`] starts refusing) and
@@ -17,8 +17,8 @@
 //! `TimeoutStopSec` is far longer than a rebuild, and `KillMode=process` means
 //! the `SIGTERM` reaches this process rather than the whole control group,
 //! which would take the `nixos-rebuild` down with it. Past `TimeoutStopSec`
-//! systemd still sends `SIGKILL` - that is the one case the repair path exists
-//! for.
+//! systemd still sends `SIGKILL` - that is the one case nothing can be done
+//! about, and it has to be cleaned up by hand.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

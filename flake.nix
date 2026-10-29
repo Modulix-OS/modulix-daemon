@@ -7,7 +7,7 @@
     flake-utils.url = "github:numtide/flake-utils";
 
     modulix-core-utils = {
-      url = "github:Modulix-OS/modulix-core-utils/v1.0.3";
+      url = "github:Modulix-OS/modulix-core-utils/v1.1.1";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };

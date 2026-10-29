@@ -1,6 +1,6 @@
 [package]
 name = "modulix-daemon"
-version = "1.0.3"
+version = "1.1.0"
 edition = "2024"
 
 [[bin]]
@@ -12,7 +12,7 @@ async-trait = "0.1"
 futures = "0.3.34"
 futures-util = "0.3"
 
-modulix-core-utils = { git = "https://github.com/Modulix-OS/modulix-core-utils", tag = "v1.0.3", features = [
+modulix-core-utils = { git = "https://github.com/Modulix-OS/modulix-core-utils", tag = "v1.1.1", features = [
     "package-info",
     "app-info-gui",
     "module-info",

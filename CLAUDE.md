@@ -189,11 +189,21 @@ regenerates `hardware-configuration.nix` and writes the `mx.hardware.*`
 options into `hardware.nix`. It takes no argument: there is nothing to name,
 the hardware is whatever is plugged in.
 
-- **Its own polkit action, `auth_admin`.** `polkit::ACTION_HARDWARE`
+- **Its own polkit action, `auth_admin_keep`.** `polkit::ACTION_HARDWARE`
   (`org.modulix.daemon.hardware`) sits with `ACTION_INSTALL`/`ACTION_REMOVE`,
   not with `ACTION_UPDATE`: the latter is deliberately `allow_active=yes` so a
   background update completes unattended, which is exactly what rewriting
-  `hardware.nix` and activating the result must *not* do.
+  `hardware.nix` and activating the result must *not* do. The `_keep` is
+  retention, not a weaker check — all three write actions prompt **once per
+  session** and polkit then serves a temporary authorization, so a second
+  `UpdateHardware` (or install) from that session runs without a prompt. It is
+  the policy file that says so; no polkit JS rule ships with `module.nix` any
+  more (the old `security.polkit.extraConfig` was the sole source of retention
+  while the defaults still said bare `auth_admin`, and became a no-op on a
+  single-admin machine once they said `auth_admin_keep` — NixOS's
+  `adminIdentities` is `unix-group:wheel`, so `auth_admin` and `auth_self`
+  collapse to the same password there). Do not reintroduce it to change
+  retention; it is only the lever for a per-group exception.
 - **Shape is `filesystem::add_mount`'s, not `UpdateSystem`'s.**
   `redetect_all_hardware` is a synchronous `make_group_transaction(…,
   BuildCommand::Switch, UpdateInput::Keep, …)` — both hardware files in one

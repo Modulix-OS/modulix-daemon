@@ -483,8 +483,10 @@ impl Daemon {
     /// # Pre-conditions
     /// The caller must be authorized for the [`ACTION_UPDATE`] polkit
     /// action. Unlike [`ACTION_INSTALL`]/[`ACTION_REMOVE`], the policy
-    /// grants this to any active session with no `auth_admin` prompt, so an
-    /// unattended update can complete on its own.
+    /// grants this to any active session with no `auth_admin_keep` prompt at
+    /// all, so an unattended update can complete on its own — including in a
+    /// session that never authenticated, which has no retained authorization
+    /// to fall back on.
     ///
     /// # Returns
     /// `"system updated"` for `"switch"`, `"system update prepared for next
@@ -539,7 +541,10 @@ impl Daemon {
     /// The caller must be authorized for the [`ACTION_HARDWARE`] polkit
     /// action. Like [`ACTION_INSTALL`]/[`ACTION_REMOVE`] and unlike
     /// [`ACTION_UPDATE`], the policy requires an active session **and** an
-    /// `auth_admin` prompt, so this never completes unattended.
+    /// `auth_admin_keep` prompt, so this never completes in a session that has
+    /// not authenticated. Retention applies here too: once that session has
+    /// answered the prompt for this action, a further `UpdateHardware` from it
+    /// rewrites `hardware.nix` and activates the result without asking again.
     ///
     /// # Returns
     /// `"hardware configuration updated"`, once the rebuild has completed.

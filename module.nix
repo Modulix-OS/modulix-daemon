@@ -163,19 +163,5 @@ in
 
     environment.systemPackages = [ cfg.package ]
       ++ lib.optional cfg.testMode mx-init-test;
-
-    security.polkit.extraConfig = ''
-      polkit.addRule(function(action, subject) {
-        if (action.id === "org.modulix.daemon.install" ||
-            action.id === "org.modulix.daemon.remove") {
-
-          if (subject.isInGroup("wheel")) {
-            return polkit.Result.AUTH_SELF_KEEP;
-          }
-
-          return polkit.Result.AUTH_ADMIN_KEEP;
-        }
-      });
-    '';
   };
 }

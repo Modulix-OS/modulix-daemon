@@ -36,7 +36,9 @@
 
 use crate::command::setting::{Setting, apply_list, apply_option};
 use crate::command::{self, Command};
-use crate::polkit::{self, ACTION_HARDWARE, ACTION_INSTALL, ACTION_REMOVE, ACTION_UPDATE};
+use crate::polkit::{
+    self, ACTION_HARDWARE, ACTION_INSTALL, ACTION_REMOVE, ACTION_SECURE_BOOT, ACTION_UPDATE,
+};
 
 /// Well-known bus name the daemon owns on the system bus.
 ///
@@ -580,6 +582,68 @@ impl Daemon {
     ) -> zbus::fdo::Result<String> {
         self.run(connection, &header, ACTION_HARDWARE, "UpdateHardware", &[])
             .await
+    }
+
+    /// Turns UEFI Secure Boot support on or off in the configuration.
+    ///
+    /// D-Bus signature: `SetSecureBoot(b enable) -> (s)`.
+    ///
+    /// Dispatches to `command::secure_boot::SetSecureBoot` through
+    /// `Daemon::run`, which authorizes the caller against
+    /// [`ACTION_SECURE_BOOT`], serialises against every other configuration
+    /// transaction and refuses once the daemon is shutting down. The boolean
+    /// is handed to the registry as the string `"true"`/`"false"`, since
+    /// `Command::execute` takes `&[&str]`.
+    ///
+    /// # Parameters
+    /// * `enable` - `true` to declare `mx.bootloader.secureBoot.enable`,
+    ///   `false` to drop the declaration.
+    ///
+    /// # Pre-conditions
+    /// Enabling needs the firmware to be in **Setup Mode** — no Platform Key
+    /// enrolled — and is refused with a D-Bus error otherwise. Keys can only
+    /// be written in that state, and nixpkgs' `limine-install.py` runs `sbctl`
+    /// without checking its exit status, so an enrollment that fails there
+    /// would be reported as a successful rebuild on a system whose loader is
+    /// left unsigned. Disabling has no such pre-condition.
+    ///
+    /// # Post-conditions
+    /// On success the option is part of the active generation. Enabling means
+    /// the rebuild has generated a key set, **replaced the firmware's Platform
+    /// Key, KEK and signature databases** and signed the loader; that takes
+    /// the firmware out of Setup Mode and no later configuration change undoes
+    /// it. The user still has to switch Secure Boot on in the firmware setup
+    /// menu — nothing here can do that.
+    ///
+    /// The call blocks for the whole `nixos-rebuild switch` — potentially
+    /// **minutes**. Everything is skipped, and the status string returned
+    /// anyway, when [`crate::dry_run::is_dry_run`] is true (the default in
+    /// debug builds). No cache is invalidated: no installed listing changes.
+    ///
+    /// # Returns
+    /// `"secure boot enabled"` or `"secure boot disabled"`.
+    ///
+    /// # Errors
+    /// A D-Bus error reply is returned, and nothing is written, if the caller
+    /// declines or is otherwise denied polkit authorization, if `enable` is
+    /// true while the firmware cannot take a new key set, if the firmware
+    /// state cannot be read, or if the underlying `modulix-core-utils`
+    /// transaction fails — in which case the configuration is left unchanged.
+    async fn set_secure_boot(
+        &self,
+        enable: bool,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        let state = if enable { "true" } else { "false" };
+        self.run(
+            connection,
+            &header,
+            ACTION_SECURE_BOOT,
+            "SetSecureBoot",
+            &[state],
+        )
+        .await
     }
 
     /// Applies scalar option and/or list-entry changes in a single call.

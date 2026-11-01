@@ -107,6 +107,16 @@ pub const ACTION_UPDATE: &str = "org.modulix.daemon.update";
 /// does rewrite and activate without asking again.
 pub const ACTION_HARDWARE: &str = "org.modulix.daemon.hardware";
 
+/// polkit action id for `SetSecureBoot`.
+///
+/// Matches the `id` attribute of its `<action>` in
+/// `org.modulix.daemon.policy`, on the same `auth_admin_keep` terms as
+/// [`ACTION_HARDWARE`]. It is the most consequential of the lot: enabling
+/// replaces the firmware's Platform Key, KEK and signature databases during
+/// the rebuild, which no later configuration change undoes - clearing them
+/// again is done from the firmware setup menu, not from here.
+pub const ACTION_SECURE_BOOT: &str = "org.modulix.daemon.secureboot";
+
 /// Checks that the caller identified by `header` is authorized for
 /// `action_id`, prompting for authentication (polkit agent) if needed.
 ///

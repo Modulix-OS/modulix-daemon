@@ -9,6 +9,7 @@ mod lifecycle;
 mod module;
 mod package;
 mod plugin;
+mod secure_boot;
 pub(crate) mod setting;
 pub(crate) mod update;
 
@@ -19,6 +20,7 @@ use hardware::UpdateHardware;
 use module::{InstallModule, UninstallModule};
 use package::{InstallPackage, UninstallPackage};
 use plugin::{InstallPlugin, UninstallPlugin};
+use secure_boot::SetSecureBoot;
 pub use update::UpdateSystem;
 
 /// A single command handler for the `org.modulix.Daemon` interface.
@@ -70,7 +72,8 @@ pub trait Command: Send + Sync {
 /// `package::InstallPackage`/`package::UninstallPackage`,
 /// `module::InstallModule`/`module::UninstallModule`,
 /// `plugin::InstallPlugin`/`plugin::UninstallPlugin`,
-/// `update::UpdateSystem` and `hardware::UpdateHardware`. Consumed by
+/// `update::UpdateSystem`, `hardware::UpdateHardware` and
+/// `secure_boot::SetSecureBoot`. Consumed by
 /// [`crate::daemon::Daemon::new`] to populate [`crate::daemon::Daemon`]'s
 /// command table.
 pub fn registry() -> Vec<Box<dyn Command>> {
@@ -83,6 +86,7 @@ pub fn registry() -> Vec<Box<dyn Command>> {
         Box::new(UninstallPlugin),
         Box::new(UpdateSystem),
         Box::new(UpdateHardware),
+        Box::new(SetSecureBoot),
     ]
 }
 

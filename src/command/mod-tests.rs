@@ -14,6 +14,7 @@ fn registry_contains_package_commands() {
             "UninstallPlugin",
             "UpdateSystem",
             "UpdateHardware",
+            "SetSecureBoot",
         ]
     );
 }

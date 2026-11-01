@@ -75,4 +75,21 @@
     </defaults>
   </action>
 
+  <action id="org.modulix.daemon.secureboot">
+    <description>Change the Secure Boot configuration</description>
+    <description
+            xml:lang="fr"
+        >Modifier la configuration du démarrage sécurisé</description>
+    <message>Authentication is required to change the Secure Boot configuration. Enabling it replaces the firmware's Secure Boot keys.</message>
+    <message
+            xml:lang="fr"
+        >Une authentification est requise pour modifier la configuration du démarrage sécurisé. L'activer remplace les clés de démarrage sécurisé du micrologiciel.</message>
+
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
 </policyconfig>
